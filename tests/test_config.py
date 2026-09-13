@@ -133,3 +133,35 @@ def test_invalid_model_runtime(config_file, runtime, error):
     config_file.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match=error):
         load_config(config_file)
+
+
+@pytest.mark.parametrize("patch, error", [
+    ({"generation": {"max_new_tokens": 0}}, "generation.max_new_tokens"),
+    ({"generation": {"max_prompt_tokens": True}}, "generation.max_prompt_tokens"),
+    ({"generation": {"max_tokens": 512}}, "unknown fields"),
+    ({"scoring": {"max_tokens": 16385}}, "Skywork scoring limit"),
+    ({"scoring": {"max_tokens": -1}}, "scoring.max_tokens"),
+    ({"scoring": {"batch_size": 0}}, "scoring.batch_size"),
+])
+def test_formatting_settings_are_validated(config_file, patch, error):
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    raw.update(patch)
+    config_file.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=error):
+        load_config(config_file)
+
+
+@pytest.mark.parametrize("patch, error", [
+    ({"policy": {"lora_rank": 0}}, "policy.lora_rank"),
+    ({"policy": {"lora_alpha": True}}, "policy.lora_alpha"),
+    ({"policy": {"target_modules": ["wrong"]}}, "projection names"),
+    ({"policy": {"target_modules": ["q_proj", "q_proj"]}}, "duplicate modules"),
+    ({"policy": {"target_modules": []}}, "projection names"),
+    ({"generation": {"do_sample": "false"}}, "generation.do_sample"),
+])
+def test_policy_settings_are_validated(config_file, patch, error):
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    raw.update(patch)
+    config_file.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=error):
+        load_config(config_file)

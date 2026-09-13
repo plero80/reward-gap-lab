@@ -12,9 +12,10 @@ The judge is a reference model, not human ground truth.
 ## Status
 
 Under construction. Configuration validation, atomic JSON saving, HH-RLHF
-prompt preparation, and basic model loading are implemented. Actual experiment
-checkpoint execution on the GPU, scoring, LoRA/value-head integration, and
-training are still pending.
+prompt preparation, basic model loading, policy/reward formatting, and frozen
+Qwen3 reward scoring, and a Qwen2 LoRA actor with a value head are implemented.
+Actual experiment checkpoint execution on the GPU and the PPO optimization
+loop are still pending.
 
 ## Development setup
 
@@ -53,7 +54,8 @@ To install the tested model-library versions and run all tests:
 
 For GPU experiments, install a CUDA-compatible PyTorch build for the target
 machine. The local loader checks were run with CPU PyTorch 2.14.0 and
-Transformers 5.17.0. The optional `models` dependency group records those tested
+Transformers 5.17.0. PEFT 0.20.0 supplies the LoRA adapter.
+The optional `models` dependency group records those tested
 versions; model tests skip when the optional libraries are absent.
 
 The model tests generate tiny checkpoints locally and do not download pretrained
@@ -89,12 +91,97 @@ policy = load_experiment_model(config, "policy")
 
 Calling the loader can download model weights into `model_cache/`. Merely
 loading the JSON downloads nothing. The base policy and both reward models
-start frozen; trainable LoRA and value-head layers will be added later.
+start frozen; `PPOActor` adds trainable LoRA and value-head layers to the policy.
 
 Skywork's model card specifies no system prompts for reward chat formatting
 and recommends staying within 16,384 tokens. These requirements belong in the
 upcoming formatting/scoring implementation. Full checkpoint loading and GPU
 execution have not yet been verified here.
+
+### Format inputs
+
+`format_policy_batch()` prepares prompts for generation;
+`format_reward_batch()` prepares prompts plus generated answers for one scorer.
+Supply each model's own tokenizer. Both return CPU token tensors and masks,
+reject overlength inputs, and leave moving tensors to the caller.
+
+After loading `config` and `policy` as above:
+
+```python
+from reward_gap.data import load_prompts
+from reward_gap.formatting import format_policy_batch
+
+prompts = load_prompts(config.data.prepared_dir / "training.json")
+batch = format_policy_batch(
+    policy.tokenizer, prompts[:2],
+    max_prompt_tokens=config.generation.max_prompt_tokens,
+    max_new_tokens=config.generation.max_new_tokens,
+    context_window=policy.model.config.max_position_embeddings,
+)
+inputs = batch.to(policy.model.device).model_inputs()
+```
+
+This produces model inputs without generating an answer. A prompt exceeding
+the configured limits raises an error; the formatter does not shorten it silently.
+
+### Score generated answers
+
+On the configured model device, use one scorer for the proxy and another for
+the judge. `RewardScorer.load()` follows the same cache and download settings
+as model loading:
+
+```python
+from reward_gap.scorers import RewardScorer
+
+proxy = RewardScorer.load(config, "proxy")
+# Supply one actual generated answer string for each prompt in this batch.
+result = proxy.score(prompt_batch, generated_answers, return_embeddings=True)
+scores = result.scores
+embeddings = result.embeddings
+```
+
+Scores are raw scalar outputs, without sigmoid or calibration. The optional
+proxy embeddings are unit-length vectors on CPU, pooled from the final hidden
+layer at the last non-padding position. The judge returns scores only.
+`scoring.batch_size` limits the number of answers processed in one forward pass;
+it is separate from the PPO rollout batch size. Scoring does not update weights
+or save results automatically.
+
+### Generate PPO rollouts with the actor
+
+After installing the `models` extra in the target environment:
+
+```python
+import torch
+from reward_gap.config import load_config
+from reward_gap.data import load_prompts
+from reward_gap.policy import PPOActor
+
+config = load_config("configs/smoke_gpu.json")
+actor = PPOActor.load(config, seed=42)
+prompts = load_prompts(config.data.prepared_dir / "training.json")
+rollout = actor.generate(prompts[:2], seed=42)
+
+with torch.no_grad():
+    old_statistics = actor.statistics(rollout)
+reference_log_probs = actor.reference_log_probs(rollout)
+answers = rollout.answers
+```
+
+This generates answers and computes token statistics, but performs no PPO
+update. `policy` settings specify the LoRA rank, scale, and projection modules.
+`generation.do_sample=true` uses the full softmax at temperature 1 so sampled
+and recomputed probabilities match. Greedy generation is available for
+evaluation by setting it to false; the future PPO trainer must require sampled
+rollouts. The trainer must also advance rollout seeds between updates.
+
+The rollout retains original token IDs, attention/response masks, EOS status,
+and length-limit status. Statistics are aligned to each generated token:
+its log probability and the value of the state before that token. Calling
+`statistics()` outside `torch.no_grad()` allows gradients for a future update.
+The reference call temporarily disables LoRA and never records gradients.
+Adapter/value-head checkpoint restoration and optimizer state belong to the
+future PPO training implementation.
 
 ## Project layout
 

@@ -25,6 +25,27 @@ class TrainingConfig:
 
 
 @dataclass(frozen=True)
+class GenerationConfig:
+    max_prompt_tokens: int = 512
+    max_new_tokens: int = 256
+    do_sample: bool = True
+
+
+@dataclass(frozen=True)
+class PolicyConfig:
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    target_modules: tuple[str, ...] = ("q_proj", "k_proj", "v_proj", "o_proj",
+                                      "gate_proj", "up_proj", "down_proj")
+
+
+@dataclass(frozen=True)
+class ScoringConfig:
+    max_tokens: int = 4096
+    batch_size: int = 4
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     device: str = "cpu"
     output_root: Path = Path("outputs")
@@ -72,6 +93,9 @@ class ExperimentConfig:
     runtime: RuntimeConfig
     data: DataConfig | None = None
     models: ModelsConfig | None = None
+    generation: GenerationConfig = field(default_factory=GenerationConfig)
+    scoring: ScoringConfig = field(default_factory=ScoringConfig)
+    policy: PolicyConfig = field(default_factory=PolicyConfig)
 
     def to_dict(self) -> dict:
         """Return JSON-compatible settings including all resolved defaults."""
@@ -79,6 +103,7 @@ class ExperimentConfig:
         result["seeds"] = list(self.seeds)
         result["runtime"]["output_root"] = str(self.runtime.output_root)
         result["runtime"]["model_cache"] = str(self.runtime.model_cache)
+        result["policy"]["target_modules"] = list(self.policy.target_modules)
         if self.data is not None:
             result["data"]["subsets"] = list(self.data.subsets)
             for name in ("cache_dir", "prepared_dir"):
@@ -218,4 +243,26 @@ def load_config(path: str | Path) -> ExperimentConfig:
             revision = _model_string(values.get("revision", "main"), f"{location}.revision")
             references[role] = ModelReference(model_id, revision)
         models = ModelsConfig(**references)
-    return ExperimentConfig(1, raw["experiment"], tuple(seeds), training, runtime, data, models)
+    generation = GenerationConfig(**_object(
+        raw.get("generation", {}), {f.name for f in fields(GenerationConfig)}, "generation"))
+    _integer(generation.max_prompt_tokens, "generation.max_prompt_tokens")
+    _integer(generation.max_new_tokens, "generation.max_new_tokens")
+    if type(generation.do_sample) is not bool:
+        raise ConfigError("generation.do_sample: expected true or false")
+    scoring = ScoringConfig(**_object(raw.get("scoring", {}), {f.name for f in fields(ScoringConfig)}, "scoring"))
+    _integer(scoring.max_tokens, "scoring.max_tokens")
+    _integer(scoring.batch_size, "scoring.batch_size")
+    if scoring.max_tokens > 16384:
+        raise ConfigError("scoring.max_tokens: Skywork scoring limit is 16384")
+    policy = PolicyConfig(**_object(raw.get("policy", {}), {f.name for f in fields(PolicyConfig)}, "policy"))
+    _integer(policy.lora_rank, "policy.lora_rank")
+    _integer(policy.lora_alpha, "policy.lora_alpha")
+    targets = policy.target_modules
+    if (not isinstance(targets, (list, tuple)) or not targets
+            or any(t not in PolicyConfig().target_modules for t in targets)):
+        raise ConfigError("policy.target_modules: expected supported Qwen projection names")
+    if len(set(targets)) != len(targets):
+        raise ConfigError("policy.target_modules: duplicate modules")
+    policy = PolicyConfig(policy.lora_rank, policy.lora_alpha, tuple(targets))
+    return ExperimentConfig(1, raw["experiment"], tuple(seeds), training, runtime, data, models,
+                            generation, scoring, policy)
