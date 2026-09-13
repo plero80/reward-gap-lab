@@ -2,6 +2,21 @@
   "schema_version": 1,
   "experiment": "smoke",
   "seeds": [42],
+  "data": {
+    "revision": "main",
+    "subsets": ["helpful-base", "helpful-online", "helpful-rejection-sampled", "harmless-base"],
+    "split_seed": 42,
+    "cache_dir": "data/raw/hh-rlhf",
+    "prepared_dir": "data/prepared/smoke",
+    "minimum_prompts": {
+      "calibration": 16,
+      "initial_memory": 32,
+      "training": 32,
+      "refresh": 16,
+      "validation": 8,
+      "final_evaluation": 16
+    }
+  },
   "training": {
     "round1_updates": 2,
     "total_updates": 4,

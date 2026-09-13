@@ -1,8 +1,8 @@
-"""Initial configuration contract; model and data settings come later."""
+"""Validated experiment and HH-RLHF preparation settings; models come later."""
 
 import json
 import math
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, field
 from pathlib import Path
 
 
@@ -27,6 +27,23 @@ class RuntimeConfig:
     allow_downloads: bool = False
 
 
+HH_SUBSETS = ("helpful-base", "helpful-online", "helpful-rejection-sampled", "harmless-base")
+COHORTS = ("calibration", "initial_memory", "training", "refresh", "validation", "final_evaluation")
+
+
+@dataclass(frozen=True)
+class DataConfig:
+    revision: str = "main"
+    subsets: tuple[str, ...] = HH_SUBSETS
+    split_seed: int = 42
+    cache_dir: Path = Path("data/raw/hh-rlhf")
+    prepared_dir: Path = Path("data/prepared/smoke")
+    minimum_prompts: dict[str, int] = field(default_factory=lambda: {
+        "calibration": 16, "initial_memory": 32, "training": 32,
+        "refresh": 16, "validation": 8, "final_evaluation": 16,
+    })
+
+
 @dataclass(frozen=True)
 class ExperimentConfig:
     schema_version: int
@@ -34,12 +51,17 @@ class ExperimentConfig:
     seeds: tuple[int, ...]
     training: TrainingConfig
     runtime: RuntimeConfig
+    data: DataConfig | None = None
 
     def to_dict(self) -> dict:
         """Return JSON-compatible settings including all resolved defaults."""
         result = asdict(self)
         result["seeds"] = list(self.seeds)
         result["runtime"]["output_root"] = str(self.runtime.output_root)
+        if self.data is not None:
+            result["data"]["subsets"] = list(self.data.subsets)
+            for name in ("cache_dir", "prepared_dir"):
+                result["data"][name] = str(getattr(self.data, name))
         return result
 
 
@@ -122,4 +144,30 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if root is None:
         raise ConfigError("Cannot locate project root: no parent pyproject.toml found")
     runtime = RuntimeConfig(runtime.device, (root / output).resolve(), runtime.allow_downloads)
-    return ExperimentConfig(1, raw["experiment"], tuple(seeds), training, runtime)
+    data = None
+    if raw.get("data") is not None:
+        values = _object(raw["data"], {f.name for f in fields(DataConfig)}, "data")
+        data = DataConfig(**values)
+        if not isinstance(data.revision, str) or not data.revision.strip():
+            raise ConfigError("data.revision: expected a nonempty revision")
+        if not isinstance(data.subsets, (list, tuple)) or not data.subsets:
+            raise ConfigError("data.subsets: expected a nonempty list")
+        if any(s not in HH_SUBSETS for s in data.subsets):
+            raise ConfigError("data.subsets: unsupported HH-RLHF preference subset")
+        if len(set(data.subsets)) != len(data.subsets):
+            raise ConfigError("data.subsets: duplicate subsets")
+        _integer(data.split_seed, "data.split_seed", minimum=0)
+        counts = _object(data.minimum_prompts, set(COHORTS), "data.minimum_prompts")
+        if set(counts) != set(COHORTS):
+            raise ConfigError("data.minimum_prompts: provide all six cohort counts")
+        for name, count in counts.items():
+            _integer(count, f"data.minimum_prompts.{name}", minimum=0 if name == "validation" else 1)
+        paths = {}
+        for name in ("cache_dir", "prepared_dir"):
+            value = getattr(data, name)
+            if not isinstance(value, (str, Path)) or not str(value).strip():
+                raise ConfigError(f"data.{name}: expected a nonempty path")
+            paths[name] = (root / value).resolve()
+        data = DataConfig(data.revision, tuple(sorted(data.subsets)), data.split_seed,
+                          paths["cache_dir"], paths["prepared_dir"], dict(counts))
+    return ExperimentConfig(1, raw["experiment"], tuple(seeds), training, runtime, data)
