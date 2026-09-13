@@ -25,4 +25,4 @@ dist/
 /model_cache/
 /outputs/
 *.pt
-*.safetensors
+*.safetensors/BUILD_NEW_REWARD_GAP_PROJECT.md
