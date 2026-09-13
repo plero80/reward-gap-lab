@@ -12,6 +12,7 @@ dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
+models = ["torch==2.14.0", "transformers==5.17.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

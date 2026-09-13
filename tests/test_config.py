@@ -74,3 +74,62 @@ def test_checked_in_smoke_config():
     config = load_config(root / "configs" / "smoke.json")
     assert config.experiment == "smoke"
     assert config.runtime.device == "cpu"
+    assert config.models.policy.id == "Qwen/Qwen2.5-0.5B-Instruct"
+    assert config.models.proxy.id == "Skywork/Skywork-Reward-V2-Qwen3-0.6B"
+    assert config.models.judge.id == "Skywork/Skywork-Reward-V2-Qwen3-4B"
+
+
+def model_references():
+    return {role: {"id": f"organization/{role}"} for role in ("policy", "proxy", "judge")}
+
+
+def test_model_references_roundtrip(config_file):
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    raw["models"] = model_references()
+    config_file.write_text(json.dumps(raw), encoding="utf-8")
+    config = load_config(config_file)
+    assert config.models.policy.revision == "main"
+    saved = config.to_dict()
+    assert saved["models"]["judge"] == {"id": "organization/judge", "revision": "main"}
+    config_file.write_text(json.dumps(saved), encoding="utf-8")
+    assert load_config(config_file) == config
+
+
+@pytest.mark.parametrize("models, message", [
+    ({}, "provide policy, proxy, and judge"),
+    ({**model_references(), "actor": {}}, "unknown fields"),
+    ({**model_references(), "policy": {"id": ""}}, "models.policy.id"),
+    ({**model_references(), "proxy": {"id": "x", "revison": "main"}}, "unknown fields"),
+    ({**model_references(), "judge": {"id": "x", "revision": 12}}, "models.judge.revision"),
+    ({**model_references(), "policy": {"revision": "main"}}, "models.policy.id"),
+])
+def test_invalid_model_references(config_file, models, message):
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    raw["models"] = models
+    config_file.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=message):
+        load_config(config_file)
+
+
+def test_gpu_smoke_config():
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs" / "smoke_gpu.json")
+    assert config.runtime.device == "cuda:0"
+    assert config.runtime.dtype == "bfloat16"
+    assert config.runtime.allow_downloads is True
+    assert config.runtime.model_cache == root / "model_cache"
+    assert config.models == load_config(root / "configs" / "smoke.json").models
+
+
+@pytest.mark.parametrize("runtime, error", [
+    ({"device": "cpu", "dtype": "bfloat16"}, "CPU loading requires"),
+    ({"device": "cuda:-1"}, "runtime.device"),
+    ({"device": "cuda:0", "dtype": "int8"}, "runtime.dtype"),
+    ({"model_cache": ""}, "runtime.model_cache"),
+])
+def test_invalid_model_runtime(config_file, runtime, error):
+    raw = json.loads(config_file.read_text(encoding="utf-8"))
+    raw["runtime"] = runtime
+    config_file.write_text(json.dumps(raw), encoding="utf-8")
+    with pytest.raises(ConfigError, match=error):
+        load_config(config_file)

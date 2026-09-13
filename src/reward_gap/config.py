@@ -1,9 +1,13 @@
-"""Validated experiment and HH-RLHF preparation settings; models come later."""
+"""Validated experiment, model-reference, and HH-RLHF preparation settings."""
 
 import json
 import math
+import re
 from dataclasses import asdict, dataclass, fields, field
 from pathlib import Path
+from typing import Literal
+
+ModelDtype = Literal["float32", "float16", "bfloat16"]
 
 
 class ConfigError(ValueError):
@@ -25,6 +29,8 @@ class RuntimeConfig:
     device: str = "cpu"
     output_root: Path = Path("outputs")
     allow_downloads: bool = False
+    dtype: ModelDtype = "float32"
+    model_cache: Path = Path("model_cache")
 
 
 HH_SUBSETS = ("helpful-base", "helpful-online", "helpful-rejection-sampled", "harmless-base")
@@ -45,6 +51,19 @@ class DataConfig:
 
 
 @dataclass(frozen=True)
+class ModelReference:
+    id: str
+    revision: str = "main"
+
+
+@dataclass(frozen=True)
+class ModelsConfig:
+    policy: ModelReference
+    proxy: ModelReference
+    judge: ModelReference
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     schema_version: int
     experiment: str
@@ -52,12 +71,14 @@ class ExperimentConfig:
     training: TrainingConfig
     runtime: RuntimeConfig
     data: DataConfig | None = None
+    models: ModelsConfig | None = None
 
     def to_dict(self) -> dict:
         """Return JSON-compatible settings including all resolved defaults."""
         result = asdict(self)
         result["seeds"] = list(self.seeds)
         result["runtime"]["output_root"] = str(self.runtime.output_root)
+        result["runtime"]["model_cache"] = str(self.runtime.model_cache)
         if self.data is not None:
             result["data"]["subsets"] = list(self.data.subsets)
             for name in ("cache_dir", "prepared_dir"):
@@ -71,6 +92,12 @@ def _object(value, allowed: set[str], location: str) -> dict:
     unknown = set(value) - allowed
     if unknown:
         raise ConfigError(f"{location}: unknown fields: {', '.join(sorted(unknown))}")
+    return value
+
+
+def _model_string(value: object, location: str) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise ConfigError(f"{location}: expected a nonempty string without surrounding whitespace")
     return value
 
 
@@ -133,8 +160,12 @@ def load_config(path: str | Path) -> ExperimentConfig:
     runtime = RuntimeConfig(**_object(
         raw.get("runtime", {}), {f.name for f in fields(RuntimeConfig)}, "runtime"
     ))
-    if runtime.device not in ("cpu", "cuda"):
-        raise ConfigError("runtime.device: expected 'cpu' or 'cuda'")
+    if not isinstance(runtime.device, str) or not re.fullmatch(r"cpu|cuda(?::\d+)?", runtime.device):
+        raise ConfigError("runtime.device: expected 'cpu', 'cuda', or 'cuda:<index>'")
+    if runtime.dtype not in ("float32", "float16", "bfloat16"):
+        raise ConfigError("runtime.dtype: expected float32, float16, or bfloat16")
+    if runtime.device == "cpu" and runtime.dtype != "float32":
+        raise ConfigError("runtime.dtype: CPU loading requires float32")
     if type(runtime.allow_downloads) is not bool:
         raise ConfigError("runtime.allow_downloads: expected true or false")
     output = runtime.output_root
@@ -143,7 +174,10 @@ def load_config(path: str | Path) -> ExperimentConfig:
     root = next((p for p in config_path.parents if (p / "pyproject.toml").is_file()), None)
     if root is None:
         raise ConfigError("Cannot locate project root: no parent pyproject.toml found")
-    runtime = RuntimeConfig(runtime.device, (root / output).resolve(), runtime.allow_downloads)
+    if not isinstance(runtime.model_cache, (str, Path)) or not str(runtime.model_cache).strip():
+        raise ConfigError("runtime.model_cache: expected a nonempty path")
+    runtime = RuntimeConfig(runtime.device, (root / output).resolve(), runtime.allow_downloads,
+                            runtime.dtype, (root / runtime.model_cache).resolve())
     data = None
     if raw.get("data") is not None:
         values = _object(raw["data"], {f.name for f in fields(DataConfig)}, "data")
@@ -170,4 +204,18 @@ def load_config(path: str | Path) -> ExperimentConfig:
             paths[name] = (root / value).resolve()
         data = DataConfig(data.revision, tuple(sorted(data.subsets)), data.split_seed,
                           paths["cache_dir"], paths["prepared_dir"], dict(counts))
-    return ExperimentConfig(1, raw["experiment"], tuple(seeds), training, runtime, data)
+    models = None
+    if raw.get("models") is not None:
+        roles = {"policy", "proxy", "judge"}
+        model_values = _object(raw["models"], roles, "models")
+        if set(model_values) != roles:
+            raise ConfigError("models: provide policy, proxy, and judge references")
+        references = {}
+        for role in ("policy", "proxy", "judge"):
+            location = f"models.{role}"
+            values = _object(model_values[role], {"id", "revision"}, location)
+            model_id = _model_string(values.get("id"), f"{location}.id")
+            revision = _model_string(values.get("revision", "main"), f"{location}.revision")
+            references[role] = ModelReference(model_id, revision)
+        models = ModelsConfig(**references)
+    return ExperimentConfig(1, raw["experiment"], tuple(seeds), training, runtime, data, models)

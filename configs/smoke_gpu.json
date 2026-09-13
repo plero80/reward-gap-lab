@@ -1,15 +1,31 @@
 {
   "schema_version": 1,
   "experiment": "smoke",
-  "seeds": [42],
+  "seeds": [
+    42
+  ],
   "models": {
-    "policy": {"id": "Qwen/Qwen2.5-0.5B-Instruct", "revision": "main"},
-    "proxy": {"id": "Skywork/Skywork-Reward-V2-Qwen3-0.6B", "revision": "main"},
-    "judge": {"id": "Skywork/Skywork-Reward-V2-Qwen3-4B", "revision": "main"}
+    "policy": {
+      "id": "Qwen/Qwen2.5-0.5B-Instruct",
+      "revision": "main"
+    },
+    "proxy": {
+      "id": "Skywork/Skywork-Reward-V2-Qwen3-0.6B",
+      "revision": "main"
+    },
+    "judge": {
+      "id": "Skywork/Skywork-Reward-V2-Qwen3-4B",
+      "revision": "main"
+    }
   },
   "data": {
     "revision": "main",
-    "subsets": ["helpful-base", "helpful-online", "helpful-rejection-sampled", "harmless-base"],
+    "subsets": [
+      "helpful-base",
+      "helpful-online",
+      "helpful-rejection-sampled",
+      "harmless-base"
+    ],
     "split_seed": 42,
     "cache_dir": "data/raw/hh-rlhf",
     "prepared_dir": "data/prepared/smoke",
@@ -26,13 +42,15 @@
     "round1_updates": 2,
     "total_updates": 4,
     "rollout_batch_size": 2,
-    "learning_rate": 0.000003,
+    "learning_rate": 3e-06,
     "kl_coefficient": 0.05,
     "checkpoint_every": 2
   },
   "runtime": {
-    "device": "cpu",
+    "device": "cuda:0",
     "output_root": "outputs",
-    "allow_downloads": false
+    "allow_downloads": true,
+    "dtype": "bfloat16",
+    "model_cache": "model_cache"
   }
 }
