@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "experiment": "smoke",
+  "seeds": [42],
+  "training": {
+    "round1_updates": 2,
+    "total_updates": 4,
+    "rollout_batch_size": 2,
+    "learning_rate": 0.000003,
+    "kl_coefficient": 0.05,
+    "checkpoint_every": 2
+  },
+  "runtime": {
+    "device": "cpu",
+    "output_root": "outputs",
+    "allow_downloads": false
+  }
+}
