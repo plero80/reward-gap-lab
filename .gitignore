@@ -28,3 +28,5 @@ dist/
 *.safetensors/BUILD_NEW_REWARD_GAP_PROJECT.md
 
 BUILD_NEW_REWARD_GAP_PROJECT.md
+
+/docs/data_design.md
