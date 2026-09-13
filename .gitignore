@@ -1,0 +1,28 @@
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environment and packaging
+.venv/
+*.egg-info/
+build/
+dist/
+
+# Notebook artifacts
+.ipynb_checkpoints/
+*.executed.ipynb
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Datasets and experiment artifacts
+/data/
+/model_cache/
+/outputs/
+*.pt
+*.safetensors
