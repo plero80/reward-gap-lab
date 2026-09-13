@@ -26,3 +26,5 @@ dist/
 /outputs/
 *.pt
 *.safetensors/BUILD_NEW_REWARD_GAP_PROJECT.md
+
+/BUILD_NEW_REWARD_GAP_PROJECT.md
