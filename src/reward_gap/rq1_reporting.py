@@ -34,6 +34,15 @@ def write_report(folder, summary):
                   "explicit never-positive detector. Precision is reported as 0 for no detections.", ""])
     if not summary["distribution_shift_evaluated"]:
         lines.append("Only the initial policy was evaluated. PPO distribution shift has not been tested.")
+    training = summary.get("ppo_training", {})
+    if training.get("performed"):
+        lines.extend(["", f"Proxy and corrected PPO each ran **{training['updates_per_arm']} updates**, starting from the same initial weights.",
+                      f"Evaluation updates: `{training['evaluation_updates']}`; the final update is always included.",
+                      "Both branches use the same prepared training schedule. The original memory, calibration,",
+                      "five predictors and detector thresholds stay frozen. Held-out results do not control training.",
+                      "Only the two final policy checkpoints are retained; intermediate answers and predictions remain saved."])
+        if training["updates_per_arm"] < 25:
+            lines.append("This short PPO run checks the pipeline; it cannot establish robustness to sustained optimization.")
     lines.extend(["", *[f"- {note}" for note in summary["limitations"]], "",
                   "Judge labels (shared by all predictors): `" + json.dumps(summary["judge_labels"]) + "`."])
     (folder / "report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")

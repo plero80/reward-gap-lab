@@ -19,6 +19,7 @@ from reward_gap.experiment import ExperimentError, ExperimentResult, FollowupExp
 from reward_gap.gap_prediction import RidgePredictor, metrics, select_cutoff, select_ridge
 from reward_gap.memory import GapMemory, MemoryContext
 from reward_gap.ppo import load_policy_checkpoint
+from reward_gap.rewards import KNNReward, ProxyReward
 
 
 def _read(path):
@@ -28,7 +29,8 @@ def _read(path):
 def load_plan(path: str | Path) -> dict:
     path = Path(path).resolve()
     raw = _read(path)
-    allowed = {"theta", "calibration_quantile", "ridge_alphas", "answers_per_prompt", "checkpoints"}
+    allowed = {"theta", "calibration_quantile", "ridge_alphas", "answers_per_prompt", "checkpoints",
+               "train_ppo", "ppo_evaluation_updates"}
     if not isinstance(raw, dict) or set(raw) - allowed:
         raise ExperimentError("Unknown RQ1 plan fields")
     plan = {"theta": None, "calibration_quantile": .95, "ridge_alphas": [.001, .01, .1, 1.],
@@ -49,6 +51,16 @@ def load_plan(path: str | Path) -> dict:
         raise ExperimentError("RQ1 plan must be within a project containing pyproject.toml")
     if not isinstance(plan["checkpoints"], list):
         raise ExperimentError("checkpoints must be a list")
+    if type(plan.get("train_ppo", False)) is not bool:
+        raise ExperimentError("train_ppo must be true or false")
+    updates = plan.get("ppo_evaluation_updates", [])
+    if (not isinstance(updates, list) or any(type(u) is not int or u < 1 for u in updates)
+            or updates != sorted(set(updates))):
+        raise ExperimentError("ppo_evaluation_updates must be strictly increasing positive integers")
+    if updates and not plan.get("train_ppo", False):
+        raise ExperimentError("ppo_evaluation_updates requires train_ppo")
+    if plan.get("train_ppo", False) and plan["checkpoints"]:
+        raise ExperimentError("Choose integrated PPO training or existing checkpoints in one RQ1 plan")
     labels = {"initial"}
     for checkpoint in plan["checkpoints"]:
         if not isinstance(checkpoint, dict) or set(checkpoint) != {"label", "path"}:
@@ -64,11 +76,12 @@ def load_plan(path: str | Path) -> dict:
 
 
 class RQ1Experiment(FollowupExperiment):
-    """Reuse stage persistence/model loading; train only two small ridge models.
+    """Fit frozen predictors, optionally train proxy/corrected PPO, then test shift.
 
     Calibration uses its dedicated cohort. All predictors fit on initial_memory,
     select settings/cutoffs on validation, and freeze before any final labels.
-    Later PPO checkpoints are inference sources only; they never update memory.
+    PPO changes the policy only; it never updates the predictors or memory.
+    Plans without train_ppo retain the existing inference-only behavior.
     """
 
     def __init__(self, config, run_dir, *, plan, **factories):
@@ -76,6 +89,9 @@ class RQ1Experiment(FollowupExperiment):
         if len(config.seeds) != 1:
             raise ExperimentError("RQ1 uses one generation seed per run; use separate runs for additional seeds")
         self.plan = plan
+        self.ppo_updates = sorted(set([*plan.get("ppo_evaluation_updates", []), config.training.total_updates])) if plan.get("train_ppo", False) else []
+        if self.ppo_updates and self.ppo_updates[-1] > config.training.total_updates:
+            raise ExperimentError("RQ1 evaluation update exceeds training.total_updates")
 
     def _check_checkpoint_splits(self):
         final_groups = {r.conversation_group for r in self.cohorts["final_evaluation"]}
@@ -171,6 +187,63 @@ class RQ1Experiment(FollowupExperiment):
         atomic_write_json(folder / "predictions.json", data["rows"])
         return {"policy": policy, "metrics": scores, "predictions": str(folder / "predictions.json")}
 
+    def _evaluate_policy(self, actor, proxy, calibration, fitted, *, label, path=None, retained=True):
+        stage = f"evaluate-{label}"
+        if self.status["stages"].get(stage, {}).get("state") == "completed":
+            return self.status["stages"][stage]["result"]
+        policy = {"label": label, "checkpoint": None, "update": 0}
+        if path is not None:
+            policy = {"label": label, **load_policy_checkpoint(actor, path), "checkpoint_retained": retained}
+        answers = self._stage(f"answers-{label}", lambda folder:
+                              self._answers(folder, actor, proxy, calibration, "final_evaluation"))
+        return self._stage(stage, lambda folder: self._test(folder, answers, fitted, policy))
+
+    def _ppo_policies(self, proxy, calibration, fitted):
+        """Train equal-budget branches using only the prepared training cohort.
+
+        Publish a boundary checkpoint before scoring it. Delete an intermediate
+        only after the next boundary is saved, so evaluation/training failures
+        can resume without regenerating labels or refitting the memory.
+        """
+        seed = self.config.seeds[0]
+        initial = self.run_dir / f"seed-{seed}" / "rq1-initial.pt"
+        raw_id = f"proxy/{calibration.calibration_id}"
+        memory = GapMemory.load(fitted["memory"], context=MemoryContext(**fitted["context"]))
+        final_update = self.config.training.total_updates
+        results = {}
+        for arm, reward, reward_id in (
+            ("proxy", ProxyReward(proxy, calibration), raw_id),
+            ("corrected", KNNReward(proxy, calibration, memory), f"knn/{calibration.calibration_id}/RQ1-frozen"),
+        ):
+            labels = [f"{arm}-update-{update}" for update in self.ppo_updates]
+            if all(self.status["stages"].get(f"evaluate-{label}", {}).get("state") == "completed" for label in labels):
+                results.update({label: self.status["stages"][f"evaluate-{label}"]["result"] for label in labels})
+                continue
+            actor = self._actor(seed)
+            if not initial.exists():
+                trainer = self._trainer(actor, ProxyReward(proxy, calibration), seed, raw_id)
+                try:
+                    trainer.save_checkpoint(initial)
+                finally:
+                    trainer.release()
+            source, source_id = initial, raw_id
+            branch = f"rq1-{arm}"
+            for update, label in zip(self.ppo_updates, labels, strict=True):
+                checkpoint = self.run_dir / f"seed-{seed}" / branch / ("final.pt" if update == final_update else f"update-{update}.pt")
+                evaluated = self.status["stages"].get(f"evaluate-{label}", {}).get("state") == "completed"
+                if not evaluated:
+                    self._stage(f"ppo/{label}", lambda folder, u=update, dest=checkpoint, src=source, sid=source_id:
+                                self._train(folder, actor, reward, seed, reward_id, src, sid, dest, u, branch))
+                    if source != initial:
+                        source.unlink(missing_ok=True)
+                results[label] = self._evaluate_policy(actor, proxy, calibration, fitted, label=label,
+                                                       path=checkpoint, retained=update == final_update)
+                source, source_id = checkpoint, reward_id
+            del actor
+            gc.collect()
+        initial.unlink(missing_ok=True)
+        return results
+
     def run(self, *, until: Literal["round1", "training", "complete"] = "complete") -> ExperimentResult:
         if until != "complete":
             raise ExperimentError("RQ1 has no PPO round boundaries; rerunning resumes its completed stages")
@@ -194,6 +267,9 @@ class RQ1Experiment(FollowupExperiment):
                 for name in ("summary.json", "metrics.csv", "report.md", "prediction_vs_actual.png", "checkpoint_metrics.png"):
                     if not (self.run_dir / name).is_file():
                         raise ExperimentError(f"Completed RQ1 run is missing {name}")
+                for arm in ("proxy", "corrected") if self.ppo_updates else ():
+                    if not (self.run_dir / f"seed-{self.config.seeds[0]}" / f"rq1-{arm}" / "final.pt").is_file():
+                        raise ExperimentError("Completed RQ1 run is missing a final PPO checkpoint")
                 return ExperimentResult(self.run_dir, self.run_dir / "status.json", self.run_dir / "summary.json", "completed")
             self.status.update(state="running", kind="rq1")
             self.status.pop("error", None)
@@ -210,24 +286,21 @@ class RQ1Experiment(FollowupExperiment):
                 fit = self._stage("fit-predictors", lambda folder:
                                   self._fit(folder, training, validation, calibration, _read(cal["rows"])))
                 fitted = _read(fit["predictors"])
-                policies = [{"label": "initial", "path": None}, *self.plan["checkpoints"]]
-                results = {}
-                for checkpoint in policies:
-                    label = checkpoint["label"]
-                    stage = f"evaluate-{label}"
-                    if self.status["stages"].get(stage, {}).get("state") == "completed":
-                        results[label] = self.status["stages"][stage]["result"]
-                        continue
-                    policy = {"label": label, "checkpoint": None, "update": 0}
-                    if checkpoint["path"]:
-                        policy = {"label": label, **load_policy_checkpoint(actor, checkpoint["path"])}
-                    answers = self._stage(f"answers-{label}", lambda folder:
-                                          self._answers(folder, actor, proxy, calibration, "final_evaluation"))
-                    results[label] = self._stage(stage, lambda folder:
-                                                 self._test(folder, answers, fitted, policy))
+                results = {"initial": self._evaluate_policy(actor, proxy, calibration, fitted, label="initial")}
+                if self.ppo_updates:
+                    del actor
+                    results.update(self._ppo_policies(proxy, calibration, fitted))
+                else:
+                    for checkpoint in self.plan["checkpoints"]:
+                        results[checkpoint["label"]] = self._evaluate_policy(actor, proxy, calibration, fitted,
+                            label=checkpoint["label"], path=checkpoint["path"])
                 summary = {"schema_version": 1, "question": "Can memory predict proxy-judge disagreement?",
                            "seed": self.config.seeds[0], "theta": fitted["theta"], "cutoffs": fitted["cutoffs"],
-                           "distribution_shift_evaluated": bool(self.plan["checkpoints"]), "results": results,
+                           "distribution_shift_evaluated": bool(self.ppo_updates or self.plan["checkpoints"]), "results": results,
+                           "ppo_training": {"performed": bool(self.ppo_updates), "evaluation_updates": self.ppo_updates,
+                                            "updates_per_arm": self.config.training.total_updates if self.ppo_updates else 0,
+                                            "training_prompts_per_arm": self.config.training.total_updates * self.config.training.rollout_batch_size if self.ppo_updates else 0,
+                                            "frozen_predictors": fit["predictors"], "frozen_memory": fitted["memory"]},
                            "judge_labels": {"calibration": len(_read(cal["rows"])), "predictor_training": training["count"],
                                             "validation": validation["count"],
                                             "final_evaluation": sum(r["metrics"]["knn"]["count"] for r in results.values())},

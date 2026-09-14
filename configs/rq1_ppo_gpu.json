@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "experiment": "followup",
+  "seeds": [42],
+  "models": {
+    "policy": {"id": "Qwen/Qwen2.5-0.5B-Instruct", "revision": "main"},
+    "proxy": {"id": "Skywork/Skywork-Reward-V2-Qwen3-0.6B", "revision": "main"},
+    "judge": {"id": "Skywork/Skywork-Reward-V2-Qwen3-4B", "revision": "main"}
+  },
+  "data": {
+    "revision": "main",
+    "subsets": ["helpful-base", "helpful-online", "helpful-rejection-sampled", "harmless-base"],
+    "split_seed": 42,
+    "cache_dir": "data/raw/hh-rlhf",
+    "prepared_dir": "data/prepared/rq1-ppo",
+    "minimum_prompts": {
+      "calibration": 128, "initial_memory": 512, "training": 1024,
+      "refresh": 16, "validation": 256, "final_evaluation": 512
+    }
+  },
+  "training": {"round1_updates": 50, "total_updates": 100, "rollout_batch_size": 8,
+               "ppo_epochs": 2, "minibatch_size": 2, "checkpoint_every": 5},
+  "generation": {"max_prompt_tokens": 8192, "max_new_tokens": 256, "do_sample": true},
+  "scoring": {"max_tokens": 16384, "batch_size": 2},
+  "memory": {"k": 8, "temperature": 0.1},
+  "runtime": {
+    "device": "cuda:0", "dtype": "bfloat16", "output_root": "outputs",
+    "model_cache": "model_cache", "allow_downloads": true
+  }
+}

@@ -329,9 +329,11 @@ The CLI also exposes `prepare --config ... --download`.
 
 The `rq1` command implements section 3 of the workshop plan. It compares kNN,
 zero gap, training-mean gap, a linear ridge gap regressor, and a linear judge-score
-student on the same held-out answers and frozen proxy embeddings. It performs
-no PPO updates. All learned predictors share the same training labels. Validation
-selects ridge regularization and F1 detector cutoffs before any final labels.
+student on the same held-out answers and frozen proxy embeddings. The default
+plan now trains proxy PPO and corrected PPO from identical initial weights,
+then checks whether the original frozen predictors still work on their answers.
+All learned predictors share the same initial training labels. Validation selects
+ridge regularization and F1 detector cutoffs before any final labels.
 
 In the activated Runpod environment, install the plotting extra:
 
@@ -339,29 +341,44 @@ In the activated Runpod environment, install the plotting extra:
 python -m pip install -e ".[research,test]"
 ```
 
-For a quick check using the already-prepared smoke cohorts:
+For a quick check using the already-prepared smoke cohorts (four PPO updates
+per branch, evaluation after update 1 and update 4):
 
 ```bash
 python -m reward_gap.cli rq1 --config configs/smoke_gpu.json --plan configs/rq1.json --run-name rq1-smoke-01
 ```
 
-For a larger exploratory experiment, prepare the separate RQ1 cohorts once,
+For a 100-update exploratory experiment, prepare the separate RQ1 PPO cohorts once,
 then run preflight and, once it passes, the prediction experiment:
 
 ```bash
-python -m reward_gap.cli prepare --config configs/rq1_gpu.json --download
-python -m reward_gap.cli preflight --config configs/rq1_gpu.json
-python -m reward_gap.cli rq1 --config configs/rq1_gpu.json --plan configs/rq1.json --run-name rq1-01
+python -m reward_gap.cli prepare --config configs/rq1_ppo_gpu.json --download
+python -m reward_gap.cli preflight --config configs/rq1_ppo_gpu.json
+python -m reward_gap.cli rq1 --config configs/rq1_ppo_gpu.json --plan configs/rq1.json --run-name rq1-ppo-01
 ```
 
 The RQ1 configuration requests at least 128 calibration, 512 predictor-training,
 256 validation, and 512 final-test prompts, using one answer per prompt. These
 are starting workshop settings, not a power calculation. Long prompts raise an
-explicit error rather than being silently truncated. RQ1 leaves the prepared
-PPO `training` and `refresh` cohorts unused. Each run uses one generation seed;
-repeat with separate seeds/configurations to assess run variability.
+explicit error rather than being silently truncated. The new preset also requests
+1,024 training prompts and trains each branch for 100 updates of eight prompts.
+The `refresh` cohort remains unused: RQ1 tests the original memory throughout.
+Each run uses one seed; repeat with separate seeds/configurations to assess
+run variability. These budgets do not guarantee a measurable distribution shift.
 
-To include distribution shift, first finish the PPO source run. Edit the paths
+The default `configs/rq1.json` enables `train_ppo` and evaluates after update 1
+and after `training.total_updates`. Add increasing update numbers to
+`ppo_evaluation_updates` for extra measurement points. Every point uses the same
+held-out prompts and generation seeds; final-test scores never change the reward
+or stopping budget. Only two final checkpoints remain, under `seed-42/rq1-proxy/`
+and `seed-42/rq1-corrected/`. Intermediate answers, predictions and plots remain
+available. Repeating the command resumes interrupted training and evaluation
+without rebuilding the memory. Use a new run name for this expanded protocol.
+
+`configs/rq1_initial.json` preserves the initial-policy-only check and can still
+use `configs/rq1_gpu.json` or an existing smoke preparation.
+
+To reuse existing checkpoints instead of training policies, finish the PPO source run. Edit the paths
 in `configs/rq1_shift.json` if needed, then use a fresh RQ1 run:
 
 ```bash
@@ -387,7 +404,8 @@ checkpoints. The table reports MAE, RMSE, R2, AUROC, AP, precision, recall, and
 positive prevalence. Undefined metrics are explicitly marked. Saved stage
 artifacts include answers, embeddings, predictors, memory, and per-method
 predictions. Completed stages are reused after failure; changing the plan or
-inputs requires a new run name. No extra policy checkpoints are saved.
+inputs requires a new run name. The external-checkpoint plan creates no extra
+policy checkpoints; integrated PPO retains only its two final checkpoints.
 
 An initial-only run does not test PPO distribution shift. A high AUROC alone
 does not demonstrate accurate numerical correction, and disagreement with the

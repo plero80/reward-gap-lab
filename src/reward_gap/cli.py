@@ -12,7 +12,7 @@ def main(argv: list[str] | None = None) -> None:
     for name, help_text in (("prepare", "Prepare disjoint HH-RLHF prompt cohorts"),
                             ("preflight", "Check inputs, device and model inference"),
                             ("run", "Run or resume the two-round experiment"),
-                            ("rq1", "Evaluate gap predictors on initial and saved PPO policies"),
+                            ("rq1", "Evaluate frozen gap predictors before and after PPO"),
                             ("gsm8k-prepare", "Prepare question-disjoint GSM8K cohorts"),
                             ("gsm8k-preflight", "Check GSM8K policy and generative graders"),
                             ("gsm8k-run", "Run or resume the three-arm GSM8K comparison"),
