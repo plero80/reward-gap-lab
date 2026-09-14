@@ -11,7 +11,7 @@ pytest.importorskip("transformers")
 
 from test_policy import loaded, actor_for, prompts
 from reward_gap.config import TrainingConfig
-from reward_gap.ppo import PPOError, PPOTrainer
+from reward_gap.ppo import PPOError, PPOTrainer, _resolved_device
 from reward_gap.formatting import format_policy_batch
 from reward_gap.rewards import RewardBatch
 
@@ -21,6 +21,21 @@ class Reward:
         values = tuple(1. + len(a) / 10 for a in answers)
         return RewardBatch(tuple(r.prompt_id for r in records), values, values, values,
                            (0.,) * len(values), (1,) * len(values), "proxy", "test-cal", "test-proxy", "v1")
+
+
+@pytest.mark.parametrize("current", [0, 1])
+def test_implicit_cuda_device_matches_current_gpu_only(monkeypatch, current):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current)
+    assert _resolved_device(torch.device("cuda")) == _resolved_device(torch.device(f"cuda:{current}"))
+    assert _resolved_device(torch.device("cuda")) != _resolved_device(torch.device(f"cuda:{1-current}"))
+    assert _resolved_device(torch.device("cuda")) != _resolved_device(torch.device("cpu"))
+
+
+def test_explicit_device_comparison_does_not_initialize_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: pytest.fail("No implicit device to resolve"))
+    assert _resolved_device(torch.device("cpu")) == torch.device("cpu")
+    assert _resolved_device(torch.device("cuda:0")) == torch.device("cuda:0")
+    assert _resolved_device(torch.device("cuda:1")) != _resolved_device(torch.device("cuda:0"))
 
 
 def trainer(loaded, **kwargs):

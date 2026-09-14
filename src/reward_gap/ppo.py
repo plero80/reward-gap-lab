@@ -29,6 +29,13 @@ class PPOError(ValueError):
     """Invalid PPO inputs, incompatible checkpoints or failed updates."""
 
 
+def _resolved_device(device: torch.device) -> torch.device:
+    """Resolve an implicit CUDA index before comparing placement."""
+    if device.type == "cuda" and device.index is None:
+        return torch.device("cuda", torch.cuda.current_device())
+    return device
+
+
 class RewardStrategy(Protocol):
     def score(self, prompts: Sequence[PromptRecord], answers: Sequence[str]) -> RewardBatch: ...
 
@@ -128,8 +135,10 @@ class PPOTrainer:
         )
         if self._backend.accelerator.num_processes != 1:
             raise PPOError("The project adapter currently supports one process/device")
-        if self._backend.accelerator.device != requested_device:
-            raise PPOError("Accelerate selected a different device from the actor")
+        selected_device = self._backend.accelerator.device
+        if _resolved_device(selected_device) != _resolved_device(requested_device):
+            raise PPOError(f"Accelerate selected a different device from the actor: "
+                           f"selected={selected_device}, requested={requested_device}")
         # Qwen's functional attention dropout is not an nn.Dropout module.
         # Keep sampling and teacher-forced PPO probabilities on the same policy.
         setattr(self.actor.model.config, "attention_dropout", 0.0)
