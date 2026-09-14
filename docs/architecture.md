@@ -57,7 +57,7 @@ reward-gap-lab/
 | calibration.py | Fit and load frozen score normalization |
 | memory.py | GapMemory: build, predict, append, and save |
 | rewards.py | ProxyReward and KNNReward strategies |
-| ppo.py | PPOTrainer and checkpoint restoration |
+| ppo.py | TRL PPO integration, experiment progress and checkpoint restoration |
 | evaluation.py | Generate, score, and save evaluation rows |
 | refresh.py | Label refresh answers and lock memory |
 | experiment.py | FollowupExperiment: stage ordering and forks |

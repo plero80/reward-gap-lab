@@ -13,13 +13,13 @@ The judge is a reference model, not human ground truth.
 
 Under construction. Configuration validation, atomic JSON saving, HH-RLHF
 prompt preparation, basic model loading, policy/reward formatting, and frozen
-Qwen3 reward scoring, and a Qwen2 LoRA actor with a value head are implemented.
-Actual experiment checkpoint execution on the GPU and the PPO optimization
-loop are still pending.
+Qwen3 reward scoring, a Qwen2 LoRA actor with a value head, calibrated reward
+strategies and a TRL-backed PPO trainer are implemented. End-to-end experiment
+orchestration and production GPU validation remain pending.
 
 ## Development setup
 
-Use Python 3.11 or newer.
+Use Python 3.12 or newer, matching the tested training environment and its pinned NumPy dependency.
 
 From the project root in PowerShell:
 
@@ -45,10 +45,10 @@ Small correctness tests should work on CPU.
 
 ### Model-loading dependencies and tests
 
-To install the tested model-library versions and run all tests:
+To install the tested model/training libraries and run all tests:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pip install -e ".[test,models]"
+.\.venv\Scripts\python.exe -m pip install -e ".[test,training]"
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
@@ -57,6 +57,8 @@ machine. The local loader checks were run with CPU PyTorch 2.14.0 and
 Transformers 5.17.0. PEFT 0.20.0 supplies the LoRA adapter.
 The optional `models` dependency group records those tested
 versions; model tests skip when the optional libraries are absent.
+The `training` extra adds pinned TRL 0.29.1, Accelerate, Datasets and NumPy.
+TRL's PPO API is experimental, so upgrades require rerunning integration tests.
 
 The model tests generate tiny checkpoints locally and do not download pretrained
 models. `reward_gap.models` supports decoder-only policy checkpoints and scalar
@@ -209,15 +211,24 @@ neighbor diagnostics. Both use the frozen proxy without calling the judge
 during reward calculation. Calibration-cohort orchestration, configuration/CLI
 wiring remain under construction.
 
-`reward_gap.ppo.PPOTrainer` implements sampled rollouts, terminal answer rewards,
-token KL penalties, masked advantages, and clipped policy/value updates on LoRA
-and the value head. Both EOS and the generation limit end an answer. The trainer
-can run a fixed prompt/seed schedule and save resumable checkpoints containing
-trainable weights, optimizer state, RNG states and progress. Reconstruct the same
-frozen model and reward artifacts before loading a checkpoint. Existing
-checkpoint files cannot be overwritten. CPU tiny-model training and exact resume
-are tested; production GPU execution and end-to-end experiment orchestration
-remain pending.
+`reward_gap.ppo.PPOTrainer` delegates generation, KL penalties, advantages,
+clipped losses and optimizer updates to Hugging Face TRL. Our adapters connect
+the existing LoRA actor/value head and ProxyReward/KNNReward strategies to its
+model-based API. No custom PPO loss or GAE implementation remains.
+
+The wrapper runs one TRL rollout/update at a time while retaining its optimizer,
+which preserves the project's fixed prompt/seed schedule and update-boundary
+checkpoints. Call `trainer.update(prompts, rollout_seed=...)` or use `train()`
+for a complete schedule. TRL controls EOS handling, masks and advantage
+normalization; its defaults differ from the former custom trainer. Training
+requires distinct PAD/primary EOS tokens, at least two prompts per rollout, a
+batch size divisible by minibatch_size, and normalize_advantages=true.
+
+Checkpoints contain LoRA/value weights, optimizer/scheduler state, progress and
+RNG information. Reconstruct the same frozen model and reward artifacts before
+loading. The new format rejects old custom-PPO checkpoints; existing checkpoint
+files cannot be overwritten. CPU tiny-model training and exact resume are
+tested. Production GPU execution and end-to-end orchestration remain pending.
 
 ## Prepare HH-RLHF data
 

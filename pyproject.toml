@@ -7,12 +7,13 @@ name = "reward-gap-lab"
 version = "0.1.0"
 description = "Experiments with kNN reward-gap correction for PPO training"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
 models = ["torch==2.14.0", "transformers==5.17.0", "peft==0.20.0"]
+training = ["reward-gap-lab[models]", "trl==0.29.1", "accelerate==1.15.0", "datasets==5.0.1", "numpy==2.5.3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

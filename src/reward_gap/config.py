@@ -44,8 +44,12 @@ class TrainingConfig:
             raise ConfigError("training: clip_range must be < 1; gamma and gae_lambda must be <= 1")
         if self.minibatch_size > self.rollout_batch_size:
             raise ConfigError("training.minibatch_size: must not exceed rollout_batch_size")
+        if self.rollout_batch_size < 2 or self.rollout_batch_size % self.minibatch_size:
+            raise ConfigError("training: TRL requires rollout_batch_size >= 2 and divisible by minibatch_size")
         if type(self.normalize_advantages) is not bool:
             raise ConfigError("training.normalize_advantages: expected true or false")
+        if not self.normalize_advantages:
+            raise ConfigError("training.normalize_advantages: TRL PPO requires true")
         if self.round1_updates >= self.total_updates:
             raise ConfigError("training.round1_updates: must be less than total_updates")
 

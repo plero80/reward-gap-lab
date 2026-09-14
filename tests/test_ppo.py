@@ -5,12 +5,14 @@ import random
 import pytest
 
 torch = pytest.importorskip("torch")
+pytest.importorskip("trl")
 pytest.importorskip("peft")
 pytest.importorskip("transformers")
 
 from test_policy import loaded, actor_for, prompts
 from reward_gap.config import TrainingConfig
-from reward_gap.ppo import PPOError, PPOTrainer, compute_gae, ppo_loss
+from reward_gap.ppo import PPOError, PPOTrainer
+from reward_gap.formatting import format_policy_batch
 from reward_gap.rewards import RewardBatch
 
 
@@ -28,46 +30,16 @@ def trainer(loaded, **kwargs):
                       experiment_id="tiny-v1", reward_id="proxy-cal1", **kwargs)
 
 
-def test_gae_terminal_reward_and_padding():
-    rewards = torch.tensor([[0., 2., 999.], [0., 0., 3.]])
-    values = torch.tensor([[0.5, 1., 888.], [1., 1., 1.]])
-    mask = torch.tensor([[True, True, False], [True, True, True]])
-    advantages, returns = compute_gae(rewards, values, mask, gamma=1., gae_lambda=1.)
-    torch.testing.assert_close(returns, torch.tensor([[2., 2., 0.], [3., 3., 3.]]))
-    torch.testing.assert_close(advantages, torch.tensor([[1.5, 1., 0.], [2., 2., 2.]]))
-    # With lambda=0, each advantage is the one-step TD residual.
-    advantages, _ = compute_gae(rewards, values, mask, gamma=0.5, gae_lambda=0.)
-    torch.testing.assert_close(advantages, torch.tensor([[0., 1., 0.], [-0.5, -0.5, 2.]]))
-
-
-def test_clipping_and_masked_loss_gradients():
-    logp = torch.tensor([[2., 0.5, float("nan")]]).log().requires_grad_()
-    values = torch.tensor([[2., 0., float("nan")]], requires_grad=True)
-    mask = torch.tensor([[True, True, False]])
-    zeros = torch.zeros(1, 3)
-    advantage = torch.tensor([[1., -1., 77.]])
-    returns = torch.tensor([[1., 1., 77.]])
-    policy, critic, clipped = ppo_loss(logp, values, zeros, zeros, advantage, returns, mask, TrainingConfig())
-    assert policy.item() == pytest.approx(-0.2)
-    assert critic.item() == pytest.approx(0.5)
-    assert clipped.item() == 1.
-    (policy + critic).backward()
-    assert logp.grad[0, 2] == 0
-    assert values.grad[0, 2] == 0
-    assert logp.grad[0, :2].tolist() == [0., 0.]
-
-
 def test_actual_update_changes_lora_and_value_but_not_base(loaded):
     run = trainer(loaded)
     before = {n: p.detach().clone() for n, p in run.actor.named_parameters()}
     metrics = run.update(prompts(), rollout_seed=7)
     assert metrics.update == 1 and metrics.prompt_position == 2
-    assert metrics.optimizer_steps == 4
     changed = [n for n, p in run.actor.named_parameters() if not torch.equal(p, before[n])]
     assert any("lora_" in n for n in changed)
     assert any(n.startswith("value_head.") for n in changed)
     assert all("lora_" in n or n.startswith("value_head.") for n in changed)
-    assert metrics.mean_sampled_kl == pytest.approx(0., abs=1e-6)
+    assert metrics.library_metrics["objective/kl"] == pytest.approx(0., abs=1e-6)
     assert all(p.grad is None for p in run.actor.parameters())
 
 
@@ -104,7 +76,7 @@ def test_checkpoint_resume_matches_uninterrupted_training(loaded, tmp_path):
     assert result == full_metrics[1:]
     assert_state_equal(full.actor.state_dict(), resumed.actor.state_dict())
     assert_state_equal(full.optimizer.state_dict(), resumed.optimizer.state_dict())
-    assert_state_equal(full._shuffle.get_state(), resumed._shuffle.get_state())
+    assert_state_equal(full._backend.lr_scheduler.state_dict(), resumed._backend.lr_scheduler.state_dict())
 
 
 def test_checkpoint_rejects_identity_mismatch_and_overwrite(loaded, tmp_path):
@@ -124,18 +96,17 @@ def test_checkpoint_rejects_identity_mismatch_and_overwrite(loaded, tmp_path):
 
 def test_failed_update_cannot_continue_or_checkpoint(loaded, tmp_path, monkeypatch):
     run = trainer(loaded)
+    batch = format_policy_batch(run.actor.tokenizer, prompts(), max_prompt_tokens=64,
+                                max_new_tokens=4, context_window=128)
+    run._initialize_backend(batch)
     initial = run.save_checkpoint(tmp_path / "initial.pt")
-    original = run.optimizer.step
-    calls = 0
+    original = run._backend.train
 
-    def fail_after_step(*args, **kwargs):
-        nonlocal calls
-        calls += 1
-        original(*args, **kwargs)
-        if calls == 2:
-            raise RuntimeError("simulated interruption")
+    def fail_after_training():
+        original()
+        raise RuntimeError("simulated interruption")
 
-    monkeypatch.setattr(run.optimizer, "step", fail_after_step)
+    monkeypatch.setattr(run._backend, "train", fail_after_training)
     with pytest.raises(RuntimeError, match="interruption"):
         run.update(prompts(), rollout_seed=7)
     assert run.update_count == 0
@@ -143,7 +114,6 @@ def test_failed_update_cannot_continue_or_checkpoint(loaded, tmp_path, monkeypat
         run.save_checkpoint(tmp_path / "bad.pt")
     with pytest.raises(PPOError, match="failed"):
         run.update(prompts(), rollout_seed=7)
-    monkeypatch.setattr(run.optimizer, "step", original)
     run.load_checkpoint(initial)
     assert run.update(prompts(), rollout_seed=7).update == 1
 
@@ -174,36 +144,10 @@ def test_bad_reward_does_not_update_weights(loaded):
             return replace(Reward().score(records, answers), rewards=(float("nan"), 1.))
     run.reward = BadReward()
     before = deepcopy(run.actor.state_dict())
-    with pytest.raises(PPOError, match="Nonfinite"):
+    with pytest.raises(ValueError, match="Nonfinite"):
         run.update(prompts(), rollout_seed=7)
     assert_state_equal(before, run.actor.state_dict())
     assert run.update_count == 0
-
-
-def test_kl_penalty_and_terminal_answer_reward(loaded, monkeypatch):
-    import reward_gap.ppo as module
-    run = trainer(loaded)
-    captured = {}
-    original = compute_gae
-
-    def inspect(rewards, values, mask, **kwargs):
-        captured["rewards"] = rewards.clone()
-        captured["mask"] = mask.clone()
-        return original(rewards, values, mask, **kwargs)
-
-    # Force a known sampled log-ratio on all response tokens.
-    monkeypatch.setattr(run.actor, "reference_log_probs",
-                        lambda rollout: run.actor.statistics(rollout).log_probs - 0.2)
-    monkeypatch.setattr(module, "compute_gae", inspect)
-    rollout = run.actor.generate(prompts(), seed=7)
-    answer_rewards = Reward().score(prompts(), rollout.answers).rewards
-    run.update(prompts(), rollout_seed=7)
-    mask = captured["mask"]
-    expected = torch.zeros_like(captured["rewards"])
-    expected[mask] = -run.config.kl_coefficient * 0.2
-    for i, length in enumerate(rollout.response_lengths):
-        expected[i, length - 1] += answer_rewards[i]
-    torch.testing.assert_close(captured["rewards"], expected)
 
 
 def test_corrupt_parameter_rejected_before_modification(loaded, tmp_path):
@@ -216,3 +160,79 @@ def test_corrupt_parameter_rejected_before_modification(loaded, tmp_path):
     with pytest.raises(PPOError, match="Invalid checkpoint parameter"):
         run.load_checkpoint(tmp_path / "bad.pt")
     assert_state_equal(before, run.actor.state_dict())
+
+
+def test_real_trl_trainer_is_called_and_optimizer_has_unique_parameters(loaded, monkeypatch):
+    from trl.experimental.ppo import PPOTrainer as LibraryTrainer
+    original = LibraryTrainer.train
+    calls = []
+
+    def tracked(backend):
+        calls.append(backend)
+        return original(backend)
+
+    monkeypatch.setattr(LibraryTrainer, "train", tracked)
+    run = trainer(loaded)
+    run.update(prompts(), rollout_seed=7)
+    assert calls == [run._backend]
+    parameters = [p for group in run.optimizer.param_groups for p in group["params"]]
+    assert len(parameters) == len({id(p) for p in parameters})
+    assert {id(p) for p in parameters} == {id(p) for p in run.actor.parameters() if p.requires_grad}
+
+
+def test_legacy_checkpoint_is_explicitly_rejected(loaded, tmp_path):
+    path = tmp_path / "legacy.pt"
+    torch.save({"schema_version": 1}, path)
+    with pytest.raises(PPOError, match="schema"):
+        trainer(loaded).load_checkpoint(path)
+
+
+def test_proxy_and_knn_rewards_reach_real_trl(loaded):
+    from reward_gap.calibration import FrozenCalibration, ScoreScale
+    from reward_gap.memory import GapMemory, MemoryContext
+    from reward_gap.rewards import ProxyReward, KNNReward
+    from reward_gap.scorers import ScoreBatch
+
+    class Proxy:
+        role = "proxy"
+        def score(self, records, answers, *, return_embeddings=False):
+            assert len(records) == len(answers)
+            assert all(isinstance(answer, str) for answer in answers)
+            return ScoreBatch(tuple(r.prompt_id for r in records), (14., 8.), (10, 20),
+                              "proxy", "proxy", "v1", torch.eye(2) if return_embeddings else None,
+                              "pool" if return_embeddings else None)
+
+    scale = ScoreScale("proxy", "v1", 10., 2.)
+    calibration = FrozenCalibration("cal1", scale, scale)
+    memory = GapMemory(["a", "b"], torch.eye(2), [0.5, -2.],
+                       context=MemoryContext("proxy", "v1", "pool", "cal1"), k=1)
+    for strategy, expected in [(ProxyReward(Proxy(), calibration), (2., -1.)),
+                               (KNNReward(Proxy(), calibration, memory), (1.5, 1.))]:
+        run = trainer(loaded)
+        run.reward = strategy
+        result = run.update(prompts(), rollout_seed=7)
+        assert run._bridge.batches[0].rewards == expected
+        assert result.library_metrics["objective/scores"] == pytest.approx(sum(expected) / 2)
+
+
+def test_reward_bridge_preserves_prompts_and_decodes_eos_padding(loaded):
+    from reward_gap._trl_bridge import RewardBridge, RewardModel
+    from trl.experimental.utils import get_reward
+    actor = actor_for(loaded)
+    records = prompts()
+    batch = format_policy_batch(actor.tokenizer, records, max_prompt_tokens=64,
+                                max_new_tokens=4, context_window=128)
+    calls = []
+    class InspectReward(Reward):
+        def score(self, records, answers):
+            calls.append((tuple(records), tuple(answers)))
+            return super().score(records, answers)
+    bridge = RewardBridge(actor.tokenizer, InspectReward())
+    bridge.bind(records, batch)
+    token = actor.tokenizer.encode("a", add_special_tokens=False)[0]
+    eos, pad = actor.tokenizer.eos_token_id, actor.tokenizer.pad_token_id
+    suffix = torch.tensor([[eos, pad, pad], [token, token, eos]])
+    sequences = torch.cat((batch.input_ids, suffix), 1)
+    _, scores, _ = get_reward(RewardModel(bridge), sequences, pad, batch.input_ids.shape[1])
+    assert calls == [(tuple(records), ("", "aa"))]
+    torch.testing.assert_close(scores, torch.tensor([1., 1.2]))

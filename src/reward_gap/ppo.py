@@ -1,21 +1,27 @@
-"""Single-device PPO over sampled answers, with update-boundary checkpoints."""
+"""TRL-backed PPO with project reward adapters and update-boundary checkpoints."""
 
 import math
 import os
 import random
 import tempfile
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from importlib.metadata import version
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import torch
+import numpy as np
+from datasets import Dataset
+from transformers import TrainerControl, GenerationConfig as HFGenerationConfig
+from trl.experimental.ppo import PPOConfig as TRLConfig, PPOTrainer as TRLTrainer
 from peft import LoraConfig
 
 from reward_gap.config import TrainingConfig
 from reward_gap.data import PromptRecord
-from reward_gap.policy import PPOActor, RolloutBatch
+from reward_gap.policy import PPOActor, _seeded
+from reward_gap.formatting import format_policy_batch
+from reward_gap._trl_bridge import RewardBridge, RewardModel, ValueModel
 from reward_gap.rewards import RewardBatch
 
 
@@ -33,83 +39,11 @@ class UpdateMetrics:
     prompt_position: int
     rollout_seed: int
     mean_reward: float
-    mean_sampled_kl: float
-    mean_response_length: float
-    eos_fraction: float
-    policy_loss: float
-    value_loss: float
-    clip_fraction: float
-    grad_norm: float
-    optimizer_steps: int
-
-
-def _mask(mask: torch.Tensor) -> None:
-    if mask.ndim != 2 or mask.dtype != torch.bool or min(mask.shape) == 0:
-        raise PPOError("Expected a nonempty boolean response mask")
-    if not mask[:, 0].all() or (mask[:, 1:] & ~mask[:, :-1]).any():
-        raise PPOError("Response masks must be nonempty contiguous prefixes")
-
-
-@torch.no_grad()
-def compute_gae(rewards: torch.Tensor, values: torch.Tensor, mask: torch.Tensor, *,
-                gamma: float, gae_lambda: float) -> tuple[torch.Tensor, torch.Tensor]:
-    """GAE for finite answers. EOS AND length-limit endings have zero bootstrap."""
-    _mask(mask)
-    if rewards.shape != mask.shape or values.shape != mask.shape:
-        raise PPOError("Rewards, values and masks must have matching shapes")
-    for value in (gamma, gae_lambda):
-        if type(value) not in (int, float) or not math.isfinite(value) or not 0 <= value <= 1:
-            raise PPOError("GAE settings must be in [0, 1]")
-    if not torch.isfinite(rewards[mask]).all() or not torch.isfinite(values[mask]).all():
-        raise PPOError("Nonfinite GAE inputs")
-    rewards = rewards.float().masked_fill(~mask, 0)
-    values = values.float().masked_fill(~mask, 0)
-    advantages = torch.zeros_like(values)
-    carry = torch.zeros_like(values[:, 0])
-    next_value = torch.zeros_like(carry)
-    for t in reversed(range(mask.shape[1])):
-        carry = (rewards[:, t] + gamma * next_value - values[:, t]
-                 + gamma * gae_lambda * carry).masked_fill(~mask[:, t], 0)
-        advantages[:, t] = carry
-        next_value = values[:, t]
-    returns = (advantages + values).masked_fill(~mask, 0)
-    return advantages, returns
-
-
-def ppo_loss(log_probs: torch.Tensor, values: torch.Tensor, old_log_probs: torch.Tensor,
-             old_values: torch.Tensor, advantages: torch.Tensor, returns: torch.Tensor,
-             mask: torch.Tensor, config: TrainingConfig) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Token-mean clipped policy and value losses, excluding all padding."""
-    _mask(mask)
-    tensors = (log_probs, values, old_log_probs, old_values, advantages, returns)
-    if any(t.shape != mask.shape for t in tensors):
-        raise PPOError("PPO tensors must match the response mask")
-    if any(not torch.isfinite(t[mask]).all() for t in tensors):
-        raise PPOError("Nonfinite PPO inputs")
-    logp, value = log_probs[mask], values[mask]
-    old_logp, old_value, advantage, target = (t[mask].detach() for t in tensors[2:])
-    ratio = (logp - old_logp).exp()
-    policy = -torch.minimum(ratio * advantage,
-                            ratio.clamp(1 - config.clip_range, 1 + config.clip_range) * advantage).mean()
-    clipped_value = old_value + (value - old_value).clamp(-config.value_clip_range, config.value_clip_range)
-    critic = 0.5 * torch.maximum((value - target).square(), (clipped_value - target).square()).mean()
-    clipped = ((ratio - 1).abs() > config.clip_range).float().mean()
-    return policy, critic, clipped
-
-
-def _select(rollout: RolloutBatch, indices: list[int]) -> RolloutBatch:
-    return replace(rollout,
-                   prompt_ids=tuple(rollout.prompt_ids[i] for i in indices),
-                   answers=tuple(rollout.answers[i] for i in indices),
-                   sequences=rollout.sequences[indices], attention_mask=rollout.attention_mask[indices],
-                   response_mask=rollout.response_mask[indices],
-                   prompt_token_counts=tuple(rollout.prompt_token_counts[i] for i in indices),
-                   response_lengths=tuple(rollout.response_lengths[i] for i in indices),
-                   finish_reasons=tuple(rollout.finish_reasons[i] for i in indices))
+    library_metrics: dict[str, float]
 
 
 class PPOTrainer:
-    """Updates LoRA and critic only. One optimizer step per sequence minibatch.
+    """Delegates generation, GAE, losses and optimization to pinned TRL PPO.
 
     experiment_id labels dataset/schedule/base artifacts; reward_id labels the
     strategy, calibration and memory snapshot. Callers must use distinct labels
@@ -134,11 +68,77 @@ class PPOTrainer:
             raise PPOError("Only LoRA and the value head may be trainable")
         self.optimizer = torch.optim.AdamW(list(self._parameters.values()), lr=config.learning_rate,
                                            betas=(0.9, 0.999), eps=1e-8, weight_decay=0.)
-        self._shuffle = torch.Generator(device="cpu").manual_seed(seed)
+        for group in self.optimizer.param_groups:
+            group["initial_lr"] = config.learning_rate
+        if config.rollout_batch_size % config.minibatch_size:
+            raise PPOError("TRL requires rollout_batch_size divisible by minibatch_size")
+        if not config.normalize_advantages:
+            raise PPOError("TRL PPO always normalizes advantages; set normalize_advantages=true")
+        if actor.tokenizer.pad_token_id == actor.tokenizer.eos_token_id:
+            raise PPOError("TRL requires distinct padding and primary EOS tokens")
+        self.seed = seed
+        self._backend: Any = None
+        self._bridge = RewardBridge(actor.tokenizer, reward)
         self.update_count = 0
         self.prompt_position = 0
         self._failed = False
         self._schedule = None
+
+    def _initialize_backend(self, batch) -> None:
+        if self._backend is not None:
+            return
+        cfg = self.config
+        requested_device = self.actor.device
+        # TRL requires an output directory even with all saving/reporting off.
+        # Use a temporary directory, not a path dependent on a notebook's cwd.
+        self._runtime_directory = tempfile.TemporaryDirectory(prefix="reward-gap-trl-")
+        setattr(self.actor.model, "generation_config", HFGenerationConfig(
+            pad_token_id=self.actor.tokenizer.pad_token_id,
+            eos_token_id=self.actor.tokenizer.eos_token_id,
+            bos_token_id=self.actor.tokenizer.bos_token_id,
+            do_sample=True, temperature=1., top_k=0, top_p=1.,
+        ))
+        args = TRLConfig(
+            output_dir=self._runtime_directory.name,
+            per_device_train_batch_size=cfg.rollout_batch_size,
+            gradient_accumulation_steps=1,
+            num_mini_batches=cfg.rollout_batch_size // cfg.minibatch_size,
+            total_episodes=cfg.rollout_batch_size,
+            local_rollout_forward_batch_size=cfg.rollout_batch_size,
+            num_sample_generations=0, response_length=self.actor.generation.max_new_tokens,
+            stop_token="eos", temperature=1., num_ppo_epochs=cfg.ppo_epochs,
+            whiten_rewards=False, kl_coef=cfg.kl_coefficient, kl_estimator="k1",
+            cliprange=cfg.clip_range, cliprange_value=cfg.value_clip_range,
+            vf_coef=cfg.value_coefficient, gamma=cfg.gamma, lam=cfg.gae_lambda,
+            max_grad_norm=cfg.max_grad_norm, learning_rate=cfg.learning_rate,
+            lr_scheduler_type="constant", optim="adamw_torch", weight_decay=0.,
+            seed=self.seed, use_cpu=self.actor.device.type == "cpu", bf16=False, fp16=False,
+            gradient_checkpointing=False, report_to="none", save_strategy="no",
+            eval_strategy="no", disable_tqdm=True, dataloader_pin_memory=False,
+            push_to_hub=False,
+        )
+        dataset = Dataset.from_dict({"input_ids": batch.input_ids.cpu().tolist()})
+        self._backend = TRLTrainer(
+            args=args, processing_class=self.actor.tokenizer, model=self.actor.model,
+            ref_model=None, reward_model=RewardModel(self._bridge),
+            value_model=ValueModel(self.actor), train_dataset=dataset, eval_dataset=dataset,
+            optimizers=(self.optimizer, torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.)),
+        )
+        if self._backend.accelerator.num_processes != 1:
+            raise PPOError("The project adapter currently supports one process/device")
+        if self._backend.accelerator.device != requested_device:
+            raise PPOError("Accelerate selected a different device from the actor")
+        # Qwen's functional attention dropout is not an nn.Dropout module.
+        # Keep sampling and teacher-forced PPO probabilities on the same policy.
+        setattr(self.actor.model.config, "attention_dropout", 0.0)
+        for module in self.actor.model.modules():
+            if hasattr(module, "attention_dropout"):
+                setattr(module, "attention_dropout", 0.0)
+        # TRL/Accelerate owns optimizer wrapping and scheduling from here on.
+        self.optimizer = self._backend.optimizer
+        if getattr(self, "_pending_scheduler", None) is not None:
+            self._backend.lr_scheduler.load_state_dict(self._pending_scheduler)
+            self._pending_scheduler = None
 
     def update(self, prompts: Sequence[PromptRecord], *, rollout_seed: int) -> UpdateMetrics:
         if self._failed:
@@ -151,64 +151,48 @@ class PPOTrainer:
                 [asdict(p) for p in prompts] != self._schedule["prompts"][self.update_count]
                 or rollout_seed != self._schedule["seeds"][self.update_count]):
             raise PPOError("Update differs from the fixed prompt/seed schedule")
-        rollout = self.actor.generate(prompts, seed=rollout_seed)
-        if not rollout.sampled:
-            raise PPOError("PPO requires sampled rollouts")
-        scored = self.reward.score(prompts, rollout.answers)
-        if scored.prompt_ids != rollout.prompt_ids or len(scored.rewards) != len(prompts):
-            raise PPOError("Reward batch does not match rollout")
-        with torch.no_grad():
-            old = self.actor.statistics(rollout)
-            reference = self.actor.reference_log_probs(rollout)
-            mask = old.response_mask
-            scalar = torch.tensor(scored.rewards, device=self.actor.device, dtype=torch.float32)
-            if not torch.isfinite(scalar).all():
-                raise PPOError("Nonfinite answer rewards")
-            sampled_kl = (old.log_probs - reference).masked_fill(~mask, 0)
-            rewards = -self.config.kl_coefficient * sampled_kl
-            ends = mask.sum(1) - 1
-            rewards[torch.arange(len(prompts), device=self.actor.device), ends] += scalar
-            advantages, returns = compute_gae(rewards, old.values, mask,
-                                              gamma=self.config.gamma, gae_lambda=self.config.gae_lambda)
-            if self.config.normalize_advantages:
-                active = advantages[mask]
-                advantages = ((advantages - active.mean()) / active.std(unbiased=False).clamp_min(1e-8)).masked_fill(~mask, 0)
-        sums = [0., 0., 0., 0.]
-        steps = 0
+        batch = format_policy_batch(
+            self.actor.tokenizer, prompts, max_prompt_tokens=self.actor.generation.max_prompt_tokens,
+            max_new_tokens=self.actor.generation.max_new_tokens, context_window=self.actor.context_window,
+        )
+        pad_id = self.actor.tokenizer.pad_token_id
+        if not isinstance(pad_id, int):
+            raise PPOError("TRL requires an integer padding token ID")
+        if (batch.input_ids.eq(pad_id) & batch.attention_mask.bool()).any():
+            raise PPOError("TRL cannot distinguish real PAD tokens inside prompts from padding")
+        numpy_state = np.random.get_state()
         try:
-            for _ in range(self.config.ppo_epochs):
-                order = torch.randperm(len(prompts), generator=self._shuffle).tolist()
-                for start in range(0, len(prompts), self.config.minibatch_size):
-                    ids = order[start:start + self.config.minibatch_size]
-                    self.optimizer.zero_grad(set_to_none=True)
-                    current = self.actor.statistics(_select(rollout, ids))
-                    policy, critic, clipped = ppo_loss(
-                        current.log_probs, current.values, old.log_probs[ids], old.values[ids],
-                        advantages[ids], returns[ids], mask[ids], self.config)
-                    loss = policy + self.config.value_coefficient * critic
-                    if not torch.isfinite(loss):
-                        raise PPOError("Nonfinite PPO loss")
-                    loss.backward()
-                    norm = torch.nn.utils.clip_grad_norm_(list(self._parameters.values()),
-                                                          self.config.max_grad_norm, error_if_nonfinite=True)
-                    self.optimizer.step()
-                    if any(not torch.isfinite(p).all() for p in self._parameters.values()):
-                        raise PPOError("Optimizer produced nonfinite parameters")
-                    for i, value in enumerate((policy, critic, clipped, norm)):
-                        sums[i] += float(value.detach())
-                    steps += 1
+            # TRL owns sampling and numpy minibatch shuffling. Isolate their seed
+            # while preserving reproducibility across checkpoint reconstruction.
+            with _seeded(rollout_seed, self.actor.device):
+                np.random.seed(rollout_seed % 2**32)
+                self._initialize_backend(batch)
+                self._bridge.strategy = self.reward
+                self._bridge.bind(prompts, batch)
+                self._backend.dataloader = [{"input_ids": batch.input_ids}]
+                self._backend.control = TrainerControl()
+                self._backend.state.log_history.clear()
+                # Construction seeds TRL internally; the caller's rollout seed
+                # must govern this update whether or not a backend was rebuilt.
+                with _seeded(rollout_seed, self.actor.device):
+                    np.random.seed(rollout_seed % 2**32)
+                    self._backend.train()
+            if any(not torch.isfinite(p).all() for p in self._parameters.values()):
+                raise PPOError("TRL produced nonfinite trainable parameters")
         except BaseException:
-            # Some optimizer steps may have succeeded. Never label that a completed update.
             self._failed = True
             raise
         finally:
+            np.random.set_state(numpy_state)
             self.optimizer.zero_grad(set_to_none=True)
         self.update_count += 1
         self.prompt_position += len(prompts)
-        return UpdateMetrics(self.update_count, self.prompt_position, rollout_seed, float(scalar.mean()),
-                             float(sampled_kl[mask].mean()), sum(rollout.response_lengths) / len(prompts),
-                             rollout.finish_reasons.count("eos") / len(prompts),
-                             sums[0] / steps, sums[1] / steps, sums[2] / steps, sums[3] / steps, steps)
+        rewards = [v for result in self._bridge.batches for v in result.rewards]
+        logged = self._backend.state.log_history[-1]
+        metrics = {k: float(v) for k, v in logged.items()
+                   if k not in ("eps", "epoch", "step") and isinstance(v, (int, float)) and math.isfinite(v)}
+        return UpdateMetrics(self.update_count, self.prompt_position, rollout_seed,
+                             sum(rewards) / len(rewards), metrics)
 
     def train(self, prompt_batches: Sequence[Sequence[PromptRecord]], rollout_seeds: Sequence[int], *,
               checkpoint_dir: str | Path | None = None, until_update: int | None = None) -> list[UpdateMetrics]:
@@ -251,17 +235,18 @@ class PPOTrainer:
                 "tokenizer": {"template": self.actor.tokenizer.chat_template,
                               "pad": self.actor.tokenizer.pad_token_id, "eos": self.actor.eos_ids,
                               "size": len(self.actor.tokenizer)},
-                "packages": {name: version(name) for name in ("torch", "transformers", "peft")}}
+                "packages": {name: version(name) for name in ("torch", "transformers", "peft", "trl", "accelerate", "numpy")}}
 
     def save_checkpoint(self, path: str | Path) -> Path:
         """Atomically publish complete training state; refuse to replace a checkpoint."""
         if self._failed:
             raise PPOError("Cannot checkpoint a partially failed update")
-        payload = {"schema_version": 1, "identity": self._identity(),
+        payload = {"schema_version": 2, "identity": self._identity(),
                    "parameters": {n: p.detach().cpu().clone() for n, p in self._parameters.items()},
                    "optimizer": self.optimizer.state_dict(), "update": self.update_count,
                    "prompt_position": self.prompt_position, "schedule": self._schedule,
-                   "shuffle_rng": self._shuffle.get_state(), "torch_rng": torch.get_rng_state(),
+                   "trainer_seed": self.seed, "torch_rng": torch.get_rng_state(),
+                   "scheduler": self._backend.lr_scheduler.state_dict() if self._backend else getattr(self, "_pending_scheduler", None),
                    "python_rng": random.getstate(),
                    "cuda_rng": torch.cuda.get_rng_state_all() if self.actor.device.type == "cuda" else []}
         destination = Path(path)
@@ -281,7 +266,7 @@ class PPOTrainer:
         """Resume into an independently loaded, matching base model and reward setup."""
         payload = torch.load(path, map_location="cpu", weights_only=True)
         if (not isinstance(payload, dict) or type(payload.get("schema_version")) is not int
-                or payload.get("schema_version") != 1):
+                or payload.get("schema_version") != 2):
             raise PPOError("Unsupported checkpoint schema")
         if payload.get("identity") != self._identity():
             raise PPOError("Checkpoint configuration, model or experiment/reward identity differs")
@@ -316,7 +301,9 @@ class PPOTrainer:
                 for name, parameter in self._parameters.items():
                     parameter.copy_(saved[name])
             self.optimizer = restored_optimizer
-            self._shuffle.set_state(payload["shuffle_rng"])
+            self.seed = payload["trainer_seed"]
+            self._backend = None
+            self._pending_scheduler = payload["scheduler"]
             torch.set_rng_state(payload["torch_rng"])
             random.setstate(payload["python_rng"])
             if self.actor.device.type == "cuda":
