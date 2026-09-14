@@ -30,7 +30,8 @@ def main(argv: list[str] | None = None) -> None:
             command.add_argument("--until", choices=("round1", "training", "complete"), default="complete",
                                  help="Pause after a stage boundary; rerun without this option to continue")
         if name == "gsm8k-run":
-            command.add_argument("--until", choices=("training", "complete"), default="complete")
+            command.add_argument("--until", choices=("preparation", "training", "complete"), default="complete",
+                                 help="preparation pauses the matched-teacher experiment before PPO")
     args = parser.parse_args(argv)
     try:
         if args.command.startswith("gsm8k-"):
@@ -51,7 +52,11 @@ def main(argv: list[str] | None = None) -> None:
                     print(json.dumps(json.loads((run_dir / "status.json").read_text()), indent=2))
                 else:
                     from reward_gap.gsm8k.experiment import GSMExperiment
-                    result = GSMExperiment(settings, run_dir).run(until=args.until)
+                    if "teacher_comparison" in settings.settings:
+                        from reward_gap.gsm8k.teachers import TeacherExperiment
+                        result = TeacherExperiment(settings, run_dir).run(until=args.until)
+                    else:
+                        result = GSMExperiment(settings, run_dir).run(until=args.until)
                     print(f"GSM8K {result.state}: {result.summary_path}")
             return
         if args.command == "prepare":

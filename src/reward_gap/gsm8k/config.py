@@ -33,7 +33,7 @@ def load_gsm_config(path) -> GSMConfig:
                 "cache_dir": "data/raw/gsm8k",
                 "cohorts": {"calibration": 128, "memory": 512, "selection": 128,
                             "monitor": 128, "refresh": 512, "ppo": 5000}}
-    if not isinstance(raw, dict) or set(raw) - (set(defaults) | {"base_config"}) or "base_config" not in raw:
+    if not isinstance(raw, dict) or set(raw) - (set(defaults) | {"base_config", "teacher_comparison"}) or "base_config" not in raw:
         raise ValueError("Invalid GSM8K configuration fields")
     root = next((p for p in path.parents if (p / "pyproject.toml").is_file()), None)
     if root is None:
@@ -71,6 +71,23 @@ def load_gsm_config(path) -> GSMConfig:
         raise ValueError("Memory is too small for k_values")
     if counts["calibration"] * values["preparation_responses"] < 2:
         raise ValueError("Calibration needs at least two responses")
+    if "teacher_comparison" in values:
+        comparison = values["teacher_comparison"]
+        if not isinstance(comparison, dict) or set(comparison) != {"teacher30", "k", "temperature"}:
+            raise ValueError("teacher_comparison needs teacher30, k, and temperature")
+        reference = comparison["teacher30"]
+        if (not isinstance(reference, dict) or set(reference) != {"id", "revision"}
+                or any(not isinstance(v, str) or not v.strip() or v != v.strip() for v in reference.values())):
+            raise ValueError("teacher30 needs a model id and revision")
+        if base.models is None or reference["id"] == base.models.judge.id:
+            raise ValueError("The teacher comparison requires two different judge models")
+        k, temperature = comparison["k"], comparison["temperature"]
+        if type(k) is not int or not 1 <= k <= counts["memory"] * values["preparation_responses"]:
+            raise ValueError("Invalid fixed teacher-comparison k")
+        if type(temperature) not in (float, int) or not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("Invalid fixed teacher-comparison temperature")
+        if values["k_values"] != [k] or values["similarity_temperatures"] != [temperature]:
+            raise ValueError("Primary teacher comparison requires the same single fixed k/temperature, without tuning")
     if values["questions_per_update"] > counts["ppo"]:
         raise ValueError("PPO pool is smaller than questions_per_update")
     for name in ("prepared_dir", "cache_dir"):

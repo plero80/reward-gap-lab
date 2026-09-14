@@ -18,13 +18,39 @@ def preflight(config):
     try:
         if config.base.runtime.device.startswith("cuda") and not torch.cuda.is_available():
             raise ValueError("CUDA is unavailable in this Python environment")
-        experiment = GSMExperiment(config, folder)
+        matched = "teacher_comparison" in config.settings
+        if matched:
+            from reward_gap.gsm8k.teachers import TeacherExperiment
+            experiment = TeacherExperiment(config, folder)
+        else:
+            experiment = GSMExperiment(config, folder)
         experiment._open_gsm()
         actor = experiment._actor(config.base.seeds[0])
         for cohort in experiment.cohorts.values():
             for question in cohort:
                 format_policy_batch(actor.tokenizer, [question.prompt()], max_prompt_tokens=config.base.generation.max_prompt_tokens,
                                     max_new_tokens=config.base.generation.max_new_tokens, context_window=actor.context_window)
+        if matched:
+            from reward_gap.gsm8k.teachers import TeacherExperiment, release_models
+            assert isinstance(experiment, TeacherExperiment)
+            experiment.proxy = experiment._scorer("proxy")
+            experiment.cohorts["calibration"] = experiment.cohorts["calibration"][:2]
+            shared = experiment._save_shared(folder, actor, "calibration", config.base.seeds[0])
+            del actor
+            del experiment.proxy
+            release_models()
+            checked = {}
+            for name in ("4b", "30b"):
+                teacher = experiment._teacher(name)
+                try:
+                    teacher.phase = "preflight"
+                    checked[name] = experiment._grade_shared(folder / name, teacher, name, shared["shared"])
+                finally:
+                    del teacher
+                    release_models()
+            report.update(state="passed", teachers=checked, models=experiment.status["models"],
+                          note="Both teacher inference paths passed sequentially; PPO still needs the smoke run.")
+            return atomic_write_json(folder / "report.json", report)
         experiment.proxy, experiment.judge = experiment._scorer("proxy"), experiment._scorer("judge")
         experiment.cohorts["calibration"] = experiment.cohorts["calibration"][:2]
         experiment._phase("preflight")

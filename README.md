@@ -9,6 +9,9 @@ corrections to the proxy reward.
 
 The judge is a reference model, not human ground truth.
 
+For setup and copyable commands for every experiment, see
+[How to run the experiments](RUN_EXPERIMENTS.md).
+
 ## Status
 
 Under construction. Configuration validation, atomic JSON saving, HH-RLHF
@@ -466,6 +469,71 @@ same run resumes completed stages and the latest recovery checkpoint. `--until
 training` stops before official-test evaluation. Only three final checkpoints
 per seed remain; monitor answers and metrics are saved without retaining every
 intermediate policy. Configuration changes require a new run name.
+
+## GSM8K: compare 4B and 30B memory teachers
+
+The `gsm8k_teachers_*` presets implement Section 11 of `README_GSM8K_extra.md`.
+They compare Base, Proxy PPO, Judge-4B PPO, kNN PPO with 4B labels, and kNN PPO with
+`Qwen/Qwen3-30B-A3B-Instruct-2507` labels. The original GSM8K presets still run
+their existing Proxy/Judge/kNN comparison.
+
+The two teachers grade the exact same saved initial-policy answers. Both memories
+reuse the same proxy grades, proxy normalization, embeddings and question IDs.
+Each teacher gets its own frozen normalization and gap labels. Both memories use
+fixed k=32 and temperature=0.05; this primary comparison does not tune retrieval
+separately. These retrieval values come from the earlier exploratory experiment.
+
+The 30B checkpoint has roughly 61 GB of BF16 weights before inference overhead;
+it is loaded sequentially with the 4B teacher after releasing the policy/proxy.
+Both teachers are unloaded for static kNN training and numeric evaluation.
+Judge-4B PPO loads the frozen 4B judge during its own training stage and uses
+its normalized grade, followed by the same format/completion penalties. It trains
+the same 0.5B policy from the same initial weights and with the same PPO budget.
+Actual GPU capacity and grading reliability need the new preflight and smoke run.
+See the [official model card](https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507).
+
+For the smoke comparison, prepare once (skip this command if the shared
+`data/prepared/gsm8k-smoke` directory is already prepared), then run preflight:
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_teachers_smoke.json --download
+python -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_teachers_smoke.json
+python -m reward_gap.cli gsm8k-run --config configs/gsm8k_teachers_smoke.json --run-name teachers-smoke-01 --until preparation
+```
+
+Preparation writes `teacher_checks.json` (grading and gap-prediction diagnostics),
+`blinded_review.json`, and `review_key.json`. Keep the key away from reviewers.
+Inspect invalid-grade/retry counts, wrong numeric answers graded >=4, unresolved
+cases, and reasoning disagreements. The grader rubric/parser must be validated
+on development data before claiming a teacher-quality result. Then continue:
+
+```bash
+python -m reward_gap.cli gsm8k-run --config configs/gsm8k_teachers_smoke.json --run-name teachers-smoke-01
+```
+
+`gsm8k_teachers_pilot.json` runs 100 updates per arm with official-test evaluation
+disabled. `gsm8k_teachers_full.json` runs 400 updates per arm for seeds 42/43/44,
+followed by official-test evaluation. These two presets share
+`data/prepared/gsm8k-followup`, which must be prepared once using either preset.
+Fix common penalty strengths on development data and pin model/dataset revisions
+before the full comparison. The supplied 0.5/0.5 penalties remain development
+candidates. Changed protocol choices require a new run name.
+
+The primary result is the paired numeric-match difference between kNN–30B and
+kNN–4B, with per-seed results and final means/sample standard deviations. The
+report also includes format, strict correctness, unresolved answers, truncation,
+training KL and grading cost. Final answers use one common numeric checker;
+teacher grades of trained-policy answers are not computed in this primary run.
+Shared initial monitor answers are graded by both teachers before PPO for
+development diagnostics. Predicted gaps are not reported as actual teacher gaps.
+
+Read `outputs/<run-name>/report.md`, `summary.json`, `metrics.csv`, and the
+`teacher-monitor-<seed>.png`/PDF plots. Only four final policy checkpoints per
+seed remain. Cached teacher labels are reused after interruption, and reviewer
+notes are preserved. Use a new run name if an earlier teacher-comparison run used
+the three-arm protocol; the new Judge-4B comparison records protocol v2.
+Direct-30B-judge PPO, independently tuned retrieval, memory
+refresh and learned students are separate optional extensions.
 
 ## Prepare HH-RLHF data
 

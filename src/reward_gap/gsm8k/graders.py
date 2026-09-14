@@ -47,7 +47,8 @@ class LanguageGrader:
         path = self.output_dir / "grading_cost.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps({"phase": self.phase, "role": self.role, **event}, allow_nan=False) + "\n")
+            stream.write(json.dumps({"phase": self.phase, "role": self.role, "model": self.loaded.source,
+                                     "revision": self.loaded.revision, **event}, allow_nan=False) + "\n")
 
     @torch.no_grad()
     def score(self, prompts, answers, *, return_embeddings=False):
@@ -91,7 +92,14 @@ class LanguageGrader:
                         settings = GenerationConfig(max_new_tokens=budget, do_sample=False, num_beams=1,
                                                     eos_token_id=self.loaded.model.generation_config.eos_token_id,
                                                     pad_token_id=self.loaded.tokenizer.pad_token_id, use_cache=True)
-                        tokens = self.loaded.model.generate(**inputs, generation_config=settings)[0, width:]
+                        try:
+                            tokens = self.loaded.model.generate(**inputs, generation_config=settings)[0, width:]
+                        except Exception as exc:
+                            self._event({"cache_hit": False, "question_id": question.id, "attempt": attempt + 1,
+                                         "input_tokens": width, "generated_tokens": 0, "output_tokens_known": False,
+                                         "seconds": time.perf_counter() - start, "valid_grade": False,
+                                         "error": str(exc)})
+                            raise
                         output = self.loaded.tokenizer.decode(tokens, skip_special_tokens=True)
                         grade = parse_grade(output)
                         event = {"cache_hit": False, "question_id": question.id, "attempt": attempt + 1,

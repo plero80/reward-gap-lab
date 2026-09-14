@@ -67,7 +67,7 @@ class GSMExperiment(FollowupExperiment):
         return actor
 
     def _open_gsm(self):
-        snapshot = {"protocol": PROTOCOL, "answer_parser": VERSION, "rubric": RUBRIC_VERSION,
+        snapshot = {"protocol": getattr(self, "protocol", PROTOCOL), "answer_parser": VERSION, "rubric": RUBRIC_VERSION,
                     "policy_stop_rule": "tokenizer_primary_eos",
                     "config": self.gsm_config.to_dict(), "manifest": self.manifest,
                     "cohorts": {name: [asdict(q) for q in rows] for name, rows in self.cohorts.items()}}
