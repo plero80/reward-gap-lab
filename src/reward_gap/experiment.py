@@ -74,10 +74,20 @@ class FollowupExperiment:
         self.cohorts: dict = {}
         self.schedules: dict = {}
 
-    def _open(self) -> None:
+    def validate_inputs(self) -> dict:
+        """Read and validate prepared cohorts/schedules without creating a run."""
         manifest = _read(self.prepared / "input_manifest.json")
         if manifest.get("schema_version") != 1:
             raise ExperimentError("Unsupported prepared-data manifest")
+        data = self.config.data
+        assert data is not None
+        for key, expected in (("split_seed", data.split_seed), ("minimum_prompts", data.minimum_prompts),
+                              ("schedule_updates", self.config.training.total_updates),
+                              ("schedule_batch_size", self.config.training.rollout_batch_size)):
+            if key in manifest and manifest[key] != expected:
+                raise ExperimentError(f"Prepared data {key} does not match configuration; prepare a new directory")
+        if "subsets" in manifest and set(manifest["subsets"]) != set(data.subsets):
+            raise ExperimentError("Prepared data subsets do not match configuration")
         self.cohorts = {name: load_prompts(self.prepared / f"{name}.json") for name in COHORTS}
         groups, ids = set(), set()
         for name, records in self.cohorts.items():
@@ -101,7 +111,10 @@ class FollowupExperiment:
         inputs = {"manifest": manifest, "cohorts": {n: [asdict(p) for p in rows] for n, rows in self.cohorts.items()},
                   "schedules": {str(s): [[p.prompt_id for p in b] for b in batches] for s, batches in self.schedules.items()}}
         # Canonical JSON also converts tuple-valued message sequences for comparisons.
-        inputs = json.loads(json.dumps(inputs))
+        return json.loads(json.dumps(inputs))
+
+    def _open(self) -> None:
+        inputs = self.validate_inputs()
         status_path = self.run_dir / "status.json"
         if status_path.exists():
             if (_read(self.run_dir / "resolved_config.json") != self.config.to_dict()

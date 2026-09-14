@@ -10,6 +10,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
 
+[project.scripts]
+reward-gap = "reward_gap.cli:main"
+
 [project.optional-dependencies]
 test = ["pytest>=8"]
 models = ["torch==2.14.0", "transformers==5.17.0", "peft==0.20.0"]

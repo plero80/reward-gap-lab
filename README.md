@@ -247,10 +247,24 @@ be rerun into a new directory.
 
 ### Run the two-round experiment
 
-After preparing data and installing `.[training]`, run:
+After preparing data and installing `.[training]` in your GPU environment,
+check the setup first:
 
 ```powershell
-.\.venv\Scripts\python.exe -m reward_gap.experiment --config configs/smoke_gpu.json --run-name workshop-01
+python -m reward_gap.cli preflight --config configs/smoke_gpu.json
+```
+
+Preflight checks prepared cohorts and schedules, CUDA availability, all policy
+prompt lengths, and generation/scoring with the actual models. It generates
+one training batch with at most 16 answer tokens, performs no PPO update, and
+saves a separate `outputs/preflight-*/report.json` on success or failure.
+Download permission follows `runtime.allow_downloads`. Passing verifies
+inference; the smoke run still needs to verify PPO and its peak memory use.
+
+Once preflight passes, run:
+
+```powershell
+python -m reward_gap.cli run --config configs/smoke_gpu.json --run-name workshop-01
 ```
 
 The coordinator fits or loads calibration and M0, runs proxy-only and static
@@ -265,6 +279,11 @@ completed runs retain only the shared corrected round-1 checkpoint and three
 final branch checkpoints per seed. Full frozen model weights are not duplicated.
 Stage attempts and evidence remain available for inspection. The coordinator
 runs branches sequentially and releases trainer resources between stages.
+
+Read progress with `python -m reward_gap.cli status --config configs/smoke_gpu.json
+--run-name workshop-01` (on one line). After reinstalling the editable package,
+`reward-gap` is also available in place of `python -m reward_gap.cli`.
+The CLI also exposes `prepare --config ... --download`.
 
 ## Prepare HH-RLHF data
 
