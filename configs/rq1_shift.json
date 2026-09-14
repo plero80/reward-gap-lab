@@ -1,0 +1,12 @@
+{
+  "theta": null,
+  "calibration_quantile": 0.95,
+  "ridge_alphas": [0.001, 0.01, 0.1, 1.0],
+  "answers_per_prompt": 1,
+  "checkpoints": [
+    {"label": "corrected-round1", "path": "outputs/smoke-01/seed-42/corrected_round1.pt"},
+    {"label": "proxy-final", "path": "outputs/smoke-01/seed-42/raw/final.pt"},
+    {"label": "static-final", "path": "outputs/smoke-01/seed-42/static/final.pt"},
+    {"label": "refreshed-final", "path": "outputs/smoke-01/seed-42/iterative/final.pt"}
+  ]
+}

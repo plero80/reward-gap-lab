@@ -58,3 +58,19 @@ def test_preflight_failure_returns_nonzero_exit(config, monkeypatch, capsys):
         cli.main(["preflight", "--config", "unused"])
     assert error.value.code == 1
     assert "CUDA unavailable" in capsys.readouterr().err
+
+
+def test_rq1_dispatches_plan_and_run_name(config, monkeypatch, capsys):
+    pytest.importorskip("trl")
+    from reward_gap import rq1
+    received = []
+    class Runner:
+        def __init__(self, settings, folder, *, plan):
+            received.extend((settings, folder, plan))
+        def run(self):
+            return SimpleNamespace(state="completed", summary_path="summary.json")
+    monkeypatch.setattr(rq1, "RQ1Experiment", Runner)
+    monkeypatch.setattr(rq1, "load_plan", lambda path: {"plan_path": path})
+    cli.main(["rq1", "--config", "unused", "--plan", "configs/rq1.json", "--run-name", "research"])
+    assert received == [config, config.runtime.output_root / "research", {"plan_path": "configs/rq1.json"}]
+    assert "completed" in capsys.readouterr().out

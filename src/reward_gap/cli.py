@@ -12,13 +12,16 @@ def main(argv: list[str] | None = None) -> None:
     for name, help_text in (("prepare", "Prepare disjoint HH-RLHF prompt cohorts"),
                             ("preflight", "Check inputs, device and model inference"),
                             ("run", "Run or resume the two-round experiment"),
+                            ("rq1", "Evaluate gap predictors on initial and saved PPO policies"),
                             ("status", "Read a saved experiment status without loading models")):
         command = commands.add_parser(name, help=help_text)
         command.add_argument("--config", required=True, help="Experiment JSON path")
         if name == "prepare":
             command.add_argument("--download", action="store_true", help="Allow dataset downloads")
-        if name in ("run", "status"):
+        if name in ("run", "status", "rq1"):
             command.add_argument("--run-name", required=True)
+        if name == "rq1":
+            command.add_argument("--plan", required=True, help="RQ1 prediction/evaluation plan JSON")
         if name == "run":
             command.add_argument("--until", choices=("round1", "training", "complete"), default="complete",
                                  help="Pause after a stage boundary; rerun without this option to continue")
@@ -41,6 +44,10 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "status":
             status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
             print(json.dumps(status, indent=2))
+        elif args.command == "rq1":
+            from reward_gap.rq1 import RQ1Experiment, load_plan
+            result = RQ1Experiment(config, run_dir, plan=load_plan(args.plan)).run()
+            print(f"RQ1 {result.state}: {result.summary_path}")
         else:
             from reward_gap.experiment import FollowupExperiment
             result = FollowupExperiment(config, run_dir).run(until=args.until)

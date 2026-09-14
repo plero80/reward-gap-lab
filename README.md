@@ -325,6 +325,75 @@ Read progress with `python -m reward_gap.cli status --config configs/smoke_gpu.j
 `reward-gap` is also available in place of `python -m reward_gap.cli`.
 The CLI also exposes `prepare --config ... --download`.
 
+## RQ1: Can memory predict disagreement?
+
+The `rq1` command implements section 3 of the workshop plan. It compares kNN,
+zero gap, training-mean gap, a linear ridge gap regressor, and a linear judge-score
+student on the same held-out answers and frozen proxy embeddings. It performs
+no PPO updates. All learned predictors share the same training labels. Validation
+selects ridge regularization and F1 detector cutoffs before any final labels.
+
+In the activated Runpod environment, install the plotting extra:
+
+```bash
+python -m pip install -e ".[research,test]"
+```
+
+For a quick check using the already-prepared smoke cohorts:
+
+```bash
+python -m reward_gap.cli rq1 --config configs/smoke_gpu.json --plan configs/rq1.json --run-name rq1-smoke-01
+```
+
+For a larger exploratory experiment, prepare the separate RQ1 cohorts once,
+then run preflight and, once it passes, the prediction experiment:
+
+```bash
+python -m reward_gap.cli prepare --config configs/rq1_gpu.json --download
+python -m reward_gap.cli preflight --config configs/rq1_gpu.json
+python -m reward_gap.cli rq1 --config configs/rq1_gpu.json --plan configs/rq1.json --run-name rq1-01
+```
+
+The RQ1 configuration requests at least 128 calibration, 512 predictor-training,
+256 validation, and 512 final-test prompts, using one answer per prompt. These
+are starting workshop settings, not a power calculation. Long prompts raise an
+explicit error rather than being silently truncated. RQ1 leaves the prepared
+PPO `training` and `refresh` cohorts unused. Each run uses one generation seed;
+repeat with separate seeds/configurations to assess run variability.
+
+To include distribution shift, first finish the PPO source run. Edit the paths
+in `configs/rq1_shift.json` if needed, then use a fresh RQ1 run:
+
+```bash
+python -m reward_gap.cli rq1 --config configs/rq1_gpu.json --plan configs/rq1_shift.json --run-name rq1-shift-01
+```
+
+That plan evaluates the initial policy, corrected round-1 checkpoint, and the
+proxy/static/refreshed final policies from `outputs/smoke-01`. Keep the source
+run's `inputs.json` with its checkpoints so RQ1 can verify test conversations
+were excluded from PPO development/training. Base model revisions and adapter
+settings must match. Use the same RQ1 generation settings across every policy.
+The command checks all requested checkpoint paths before generating labels.
+
+Default high-gap labels use `g > theta`, with theta fixed to the nonnegative
+95th percentile of calibration gaps. Set an explicit nonnegative `theta` in
+the plan to override that rule. Normalization, predictors, and detector cutoffs
+remain fixed across policy checkpoints. `answers_per_prompt` in the plan can
+increase sampling; related answers always remain in their original cohort.
+
+Under `outputs/<run-name>/`, read `report.md`, `metrics.csv`, and `summary.json`.
+PNG/PDF figures show predicted versus actual gaps and performance across
+checkpoints. The table reports MAE, RMSE, R2, AUROC, AP, precision, recall, and
+positive prevalence. Undefined metrics are explicitly marked. Saved stage
+artifacts include answers, embeddings, predictors, memory, and per-method
+predictions. Completed stages are reused after failure; changing the plan or
+inputs requires a new run name. No extra policy checkpoints are saved.
+
+An initial-only run does not test PPO distribution shift. A high AUROC alone
+does not demonstrate accurate numerical correction, and disagreement with the
+judge is not independently verified reward hacking. The ridge student is a
+small frozen-feature baseline, not a fine-tuned reward language model.
+
 ## Prepare HH-RLHF data
 
 From the project root, allow the first dataset download explicitly:

@@ -36,6 +36,51 @@ def _resolved_device(device: torch.device) -> torch.device:
     return device
 
 
+def _policy_identity(actor: PPOActor) -> dict:
+    adapter = actor.model.peft_config["default"]
+    if not isinstance(adapter, LoraConfig) or not isinstance(adapter.target_modules, set):
+        raise PPOError("Checkpoint requires the actor's named LoRA target modules")
+    return {"source": actor.source, "revision": actor.revision,
+            "context_window": actor.context_window,
+            "base_dtype": str(next(actor.model.parameters()).dtype),
+            "adapter": {"rank": adapter.r, "alpha": adapter.lora_alpha,
+                        "targets": sorted(adapter.target_modules)},
+            "tokenizer": {"template": actor.tokenizer.chat_template,
+                          "pad": actor.tokenizer.pad_token_id, "eos": actor.eos_ids,
+                          "size": len(actor.tokenizer)}}
+
+
+def load_policy_checkpoint(actor: PPOActor, path: str | Path) -> dict:
+    """Load only policy/value weights for held-out inference, without optimizer/RNG.
+
+    Generation limits and device may differ from training; model, tokenizer,
+    precision and adapter must match. No checkpoint or training state is changed.
+    """
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, dict) or payload.get("schema_version") != 2:
+        raise PPOError("Unsupported checkpoint schema")
+    identity = payload.get("identity", {})
+    if (not isinstance(identity, dict) or type(payload.get("update")) is not int or payload["update"] < 0
+            or type(payload.get("trainer_seed")) is not int):
+        raise PPOError("Invalid inference checkpoint metadata")
+    if any(identity.get(key) != value for key, value in _policy_identity(actor).items()):
+        raise PPOError("Inference checkpoint model, tokenizer or adapter differs")
+    parameters = {name: parameter for name, parameter in actor.named_parameters() if parameter.requires_grad}
+    saved = payload.get("parameters")
+    if not isinstance(saved, dict) or set(saved) != set(parameters):
+        raise PPOError("Checkpoint trainable parameter names differ")
+    for name, parameter in parameters.items():
+        value = saved[name]
+        if (not isinstance(value, torch.Tensor) or value.shape != parameter.shape
+                or value.dtype != parameter.dtype or not torch.isfinite(value).all()):
+            raise PPOError(f"Invalid checkpoint parameter: {name}")
+    with torch.no_grad():
+        for name, parameter in parameters.items():
+            parameter.copy_(saved[name])
+    return {"checkpoint": str(Path(path).resolve()), "update": payload["update"],
+            "trainer_seed": payload["trainer_seed"], "identity": identity}
+
+
 class RewardStrategy(Protocol):
     def score(self, prompts: Sequence[PromptRecord], answers: Sequence[str]) -> RewardBatch: ...
 
@@ -233,19 +278,9 @@ class PPOTrainer:
         return metrics
 
     def _identity(self) -> dict:
-        adapter = self.actor.model.peft_config["default"]
-        if not isinstance(adapter, LoraConfig) or not isinstance(adapter.target_modules, set):
-            raise PPOError("Checkpoint requires the actor's named LoRA target modules")
         return {"experiment_id": self.experiment_id, "reward_id": self.reward_id,
                 "training": asdict(self.config), "generation": asdict(self.actor.generation),
-                "source": self.actor.source, "revision": self.actor.revision,
-                "device": str(self.actor.device), "context_window": self.actor.context_window,
-                "base_dtype": str(next(self.actor.model.parameters()).dtype),
-                "adapter": {"rank": adapter.r, "alpha": adapter.lora_alpha,
-                            "targets": sorted(adapter.target_modules)},
-                "tokenizer": {"template": self.actor.tokenizer.chat_template,
-                              "pad": self.actor.tokenizer.pad_token_id, "eos": self.actor.eos_ids,
-                              "size": len(self.actor.tokenizer)},
+                "device": str(self.actor.device), **_policy_identity(self.actor),
                 "packages": {name: version(name) for name in ("torch", "transformers", "peft", "trl", "accelerate", "numpy")}}
 
     def save_checkpoint(self, path: str | Path, *, replace_existing: bool = False) -> Path:

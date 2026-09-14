@@ -11,7 +11,7 @@ pytest.importorskip("transformers")
 
 from test_policy import loaded, actor_for, prompts
 from reward_gap.config import TrainingConfig
-from reward_gap.ppo import PPOError, PPOTrainer, _resolved_device
+from reward_gap.ppo import PPOError, PPOTrainer, _resolved_device, load_policy_checkpoint
 from reward_gap.formatting import format_policy_batch
 from reward_gap.rewards import RewardBatch
 
@@ -71,6 +71,32 @@ def assert_state_equal(left, right):
             assert_state_equal(a, b)
     else:
         assert left == right
+
+
+def test_inference_checkpoint_loads_weights_without_restoring_rng(loaded, tmp_path):
+    source = trainer(loaded)
+    source.update(prompts(), rollout_seed=7)
+    path = source.save_checkpoint(tmp_path / "policy.pt")
+    target = actor_for(deepcopy(loaded))
+    target.generation = replace(target.generation, max_new_tokens=3)
+    rng = torch.get_rng_state().clone()
+    metadata = load_policy_checkpoint(target, path)
+    assert metadata["update"] == 1
+    assert torch.equal(torch.get_rng_state(), rng)
+    for name, parameter in target.named_parameters():
+        if parameter.requires_grad:
+            torch.testing.assert_close(parameter, source._parameters[name], rtol=0, atol=0)
+
+
+def test_inference_checkpoint_rejects_wrong_base_before_mutating(loaded, tmp_path):
+    source = trainer(loaded)
+    path = source.save_checkpoint(tmp_path / "policy.pt")
+    target = actor_for(deepcopy(loaded))
+    target.revision = "different"
+    before = {name: parameter.clone() for name, parameter in target.named_parameters()}
+    with pytest.raises(PPOError, match="differs"):
+        load_policy_checkpoint(target, path)
+    assert all(torch.equal(parameter, before[name]) for name, parameter in target.named_parameters())
 
 
 def test_checkpoint_resume_matches_uninterrupted_training(loaded, tmp_path):
