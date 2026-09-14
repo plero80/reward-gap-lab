@@ -44,6 +44,46 @@ Once tests exist, run them with:
 Full experiments will target a Linux GPU environment.
 Small correctness tests should work on CPU.
 
+### Runpod setup
+
+Keep the checkout under `/workspace/reward-gap-lab` on your attached persistent
+storage. Use Python 3.12 or newer. In the pod terminal, run:
+
+```bash
+cd /workspace/reward-gap-lab
+python scripts/setup_runpod.py
+source .venv-runpod/bin/activate
+```
+
+Continue only if setup reports success. This creates a separate Linux environment
+and installs `.[training,test]` from `pyproject.toml`. The separate environment is
+needed because the template's PyTorch, torchvision, and torchaudio versions may
+conflict with our pinned PyTorch version. It does not inherit or uninstall the
+template's libraries. It will download its own PyTorch build and dependencies;
+allow disk space for them. Do not copy the Windows `.venv` to the pod.
+
+Setup checks dependency compatibility, project imports, and a CUDA calculation,
+and saves the installed package list to `outputs/setup/environment.txt`. A CUDA
+failure needs a compatible PyTorch build and host GPU driver before proceeding;
+the script does not install drivers. GPU training still needs the smoke test.
+
+After activation, prepare data once if it is not already present, then preflight:
+
+```bash
+python -m reward_gap.cli prepare --config configs/smoke_gpu.json --download
+python -m reward_gap.cli preflight --config configs/smoke_gpu.json
+```
+
+Only after preflight passes:
+
+```bash
+python -m reward_gap.cli run --config configs/smoke_gpu.json --run-name workshop-01
+```
+
+Activate `.venv-runpod` again in each new terminal. Repeating the setup script
+reuses this environment. No model weights or datasets are downloaded by setup;
+preparation and preflight perform those downloads according to their settings.
+
 ### Model-loading dependencies and tests
 
 To install the tested model/training libraries and run all tests:

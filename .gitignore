@@ -7,6 +7,7 @@ __pycache__/
 
 # Virtual environment and packaging
 .venv/
+.venv-runpod/
 *.egg-info/
 build/
 dist/
