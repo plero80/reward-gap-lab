@@ -92,7 +92,7 @@ directory in a copied config; do not mix partitions from different settings.
 | `followup.json` | `data/prepared/followup/` | `input_manifest.json` |
 | `rq1_ppo_gpu.json` | `data/prepared/rq1-ppo/` | `input_manifest.json` |
 | `rq1_gpu.json` | `data/prepared/rq1/` | `input_manifest.json` |
-| `gsm8k_smoke.json`, `gsm8k_teachers_smoke.json` | `data/prepared/gsm8k-smoke/` | `manifest.json` |
+| `gsm8k_smoke.json`, `gsm8k_teachers_smoke.json`, `gsm8k_h200_smoke.json` | `data/prepared/gsm8k-smoke/` | `manifest.json` |
 | All GSM8K pilot/full presets, including teachers | `data/prepared/gsm8k-followup/` | `manifest.json` |
 
 Sharing prepared questions does not share a trained policy or a run directory.
@@ -229,6 +229,127 @@ python -m reward_gap.cli gsm8k-status --config configs/gsm8k_full.json --run-nam
 
 Results are under `outputs/gsm8k-full-01/`. Three final policy checkpoints
 remain per seed, under `seed-<seed>/proxy/`, `judge/` and `knn/` as `final.pt`.
+
+### H200 NVL: full standard Experiment 2, with the computer disconnected
+
+Use `configs/gsm8k_h200_full.json` with `configs/gsm8k_models_h200.json`
+on **one H200 NVL GPU**. This is the standard Base / Proxy PPO / Judge-4B PPO /
+kNN-4B PPO comparison. The 30B teacher extension is in section 6.
+
+NVIDIA lists 141 GB memory and BF16 support for H200 NVL
+([hardware specifications](https://www.nvidia.com/en-us/data-center/h200/)).
+The preset uses `cuda:0` and BF16. It keeps 16 responses per PPO batch,
+minibatches of 4, two PPO epochs, the same learning rate and answer token budget.
+Preparation/evaluation policy generation uses batches of 8 instead of 2.
+The current language graders still process answers individually; that setting
+does not batch grader generation or guarantee a particular speedup.
+
+The full run has seeds 42/43/44, 400 scheduled batches per training arm, and
+official-test evaluation enabled without a test limit. It writes one rolling
+checkpoint every 25 batches, replacing the previous one, then retains a final
+checkpoint per arm/seed. After an interruption, up to 24 batches since the last
+checkpoint may need to repeat. Use a new run name for this preset.
+
+**1. Get the updated files onto the H200 pod.** Copy the three H200 config files
+and this guide, or commit/push them from your computer and then use
+`git pull --ff-only` on the pod. Local edits are not automatically uploaded.
+Use the setup procedure in section 2 if this new pod has no working environment.
+It reuses the pod's existing PyTorch/CUDA; the H200 preset needs no additional
+Python dependencies. Keep data, model cache, logs and outputs on persistent
+`/workspace` storage.
+
+**2. Start a persistent terminal session.** In the pod's terminal:
+
+```bash
+tmux new -s gsm8k-h200
+```
+
+If `tmux` is missing on the usual Ubuntu/Debian pod, install it with
+`apt-get update && apt-get install -y tmux`, then run the command above.
+Inside the new session:
+
+```bash
+cd /workspace/reward-gap-lab
+source /tmp/reward-gap-lab-venv/bin/activate
+set -o pipefail
+mkdir -p outputs/logs
+nvidia-smi --query-gpu=name,memory.total --format=csv
+```
+
+The project currently uses a single GPU/process; launch with `python`, without
+multi-process `accelerate launch` or `torchrun`.
+
+**3. Check the full batch size on the H200 once.** The earlier standard smoke
+used only four responses per PPO batch. This H200 smoke uses the full batch of
+16, with the full model/token/minibatch settings and small data cohorts. This
+checks representative training memory use, not every possible full-run prompt.
+Reuse existing matching smoke inputs; otherwise prepare them first:
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_h200_smoke.json --download
+```
+
+Skip that preparation command if `data/prepared/gsm8k-smoke/manifest.json`
+already exists from your completed smoke run. Then:
+
+```bash
+python -u -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_h200_smoke.json &&
+python -u -m reward_gap.cli gsm8k-run --config configs/gsm8k_h200_smoke.json --run-name gsm8k-h200-smoke-01 2>&1 | tee -a outputs/logs/gsm8k-h200-smoke-01.log
+```
+
+Continue to the full run after `GSM8K completed`. Check its `summary.json`
+training entries for successful `optimized_batches` and any skipped batches.
+
+**4. Prepare the larger inputs once.** Your existing small smoke inputs are
+not the full inputs. Skip this command only if matching
+`data/prepared/gsm8k-followup/manifest.json` already exists:
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_h200_full.json --download
+```
+
+After successful preparation, start the full run in the same tmux session:
+
+```bash
+python -u -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_h200_full.json &&
+python -u -m reward_gap.cli gsm8k-run --config configs/gsm8k_h200_full.json --run-name gsm8k-h200-full-01 2>&1 | tee -a outputs/logs/gsm8k-h200-full-01.log
+```
+
+`&&` starts training only after preflight passes. `-u` flushes Python output
+promptly; `tee -a` displays and saves console output, appending on resume.
+The log lives outside the run directory because a new run requires an empty
+run directory. Do not start a second process with the same run name.
+
+**5. Disconnect.** Press **Ctrl+B**, release both keys, then press **D** to
+detach. You can now close the browser or turn off your computer: tmux keeps
+the session running on the pod
+([Runpod's tmux guide](https://docs.runpod.io/tips-and-tricks/tmux)).
+Keep the pod running. Detaching does not stop GPU billing, and tmux cannot
+survive a pod stop, restart or termination. When the run finishes, the pod
+continues running until you stop it yourself.
+
+**6. Return and inspect progress.** Open a new terminal on the same pod:
+
+```bash
+tmux attach -t gsm8k-h200
+```
+
+Or inspect from a separate terminal without attaching:
+
+```bash
+cd /workspace/reward-gap-lab
+source /tmp/reward-gap-lab-venv/bin/activate
+python -m reward_gap.cli gsm8k-status --config configs/gsm8k_h200_full.json --run-name gsm8k-h200-full-01
+tail -n 30 outputs/logs/gsm8k-h200-full-01.log
+```
+
+Results are in `outputs/gsm8k-h200-full-01/report.md`, `metrics.csv`,
+`summary.json` and its linked answer files. After a genuine interruption,
+restore the environment if missing and repeat the same full run command with
+the same configuration and name; completed stages/checkpoints are reused.
+A failed process can leave the saved state as `running` after an abrupt kill,
+so also check the tmux terminal/log. These presets have been validated locally;
+H200 runtime, throughput and peak VRAM must be checked on your pod.
 
 ## 6. GSM8K extension: compare 4B and 30B teachers
 

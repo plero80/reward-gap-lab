@@ -1,0 +1,32 @@
+{
+  "base_config": "configs/gsm8k_models_h200.json",
+  "data_seed": 42,
+  "run_seeds": [42, 43, 44],
+  "updates": 400,
+  "questions_per_update": 8,
+  "responses_per_question": 2,
+  "preparation_responses": 2,
+  "monitor_every": 25,
+  "checkpoint_every": 25,
+  "policy_temperature": 0.7,
+  "grading_budgets": [128, 256, 512],
+  "grading_max_input": 4096,
+  "prepared_dir": "data/prepared/gsm8k-followup",
+  "cache_dir": "data/raw/gsm8k",
+  "dataset_revision": "main",
+  "cohorts": {
+    "calibration": 128,
+    "memory": 512,
+    "selection": 128,
+    "monitor": 128,
+    "refresh": 512,
+    "ppo": 5000
+  },
+  "k_values": [8, 16, 32],
+  "similarity_temperatures": [0.05, 0.1],
+  "gap_quantile": 0.95,
+  "format_penalty": 0.5,
+  "length_penalty": 0.5,
+  "evaluate_test": true,
+  "test_limit": null
+}

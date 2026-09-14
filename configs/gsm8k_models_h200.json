@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "experiment": "followup",
+  "seeds": [42],
+  "models": {
+    "policy": {"id": "Qwen/Qwen2.5-0.5B-Instruct", "revision": "main"},
+    "proxy": {"id": "Qwen/Qwen2.5-1.5B-Instruct", "revision": "main"},
+    "judge": {"id": "Qwen/Qwen3-4B-Instruct-2507", "revision": "main"}
+  },
+  "training": {
+    "round1_updates": 200,
+    "total_updates": 400,
+    "rollout_batch_size": 16,
+    "minibatch_size": 4,
+    "ppo_epochs": 2,
+    "learning_rate": 0.00001,
+    "kl_coefficient": 0.01,
+    "checkpoint_every": 25
+  },
+  "generation": {"max_prompt_tokens": 2048, "max_new_tokens": 768, "do_sample": true},
+  "scoring": {"max_tokens": 4096, "batch_size": 8},
+  "runtime": {
+    "device": "cuda:0",
+    "dtype": "bfloat16",
+    "model_cache": "model_cache",
+    "output_root": "outputs",
+    "allow_downloads": true
+  }
+}
