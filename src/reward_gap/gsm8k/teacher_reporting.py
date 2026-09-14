@@ -11,6 +11,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from reward_gap.artifacts import atomic_write_json
 from reward_gap.gsm8k.metrics import _correlation
+from reward_gap.gsm8k.recovery import aggregate_present
 
 
 def read(path):
@@ -27,7 +28,7 @@ def preparation_report(experiment):
             rows[name] = read(source["monitor"])
             resolved = [r for r in rows[name] if not r["unresolved"]]
             wrong = [r for r in resolved if r["numeric_mismatch"]]
-            checks.append({"seed": seed, "teacher": name, "teacher_identity": rows[name][0]["teacher_identity"],
+            checks.append({"seed": seed, "teacher": name, "teacher_identity": experiment.status["models"][f"teacher-{name}"],
                            "count": len(rows[name]), "resolved": len(resolved), "unresolved": len(rows[name]) - len(resolved),
                            "wrong_numeric": len(wrong), "wrong_numeric_grade_ge_4": sum(r["raw_judge"] >= 4 for r in wrong),
                            "high_grade_rate_among_wrong": sum(r["raw_judge"] >= 4 for r in wrong) / len(wrong) if wrong else None,
@@ -63,7 +64,7 @@ def write_report(folder, summary):
     rows = [{"seed": r["seed"], "arm": r["arm"], "cohort": r["cohort"], "update": r["update"], **r["metrics"]}
             for r in summary["results"]]
     fields = ["seed", "arm", "cohort", "update", "numeric_match", "strict_match", "format_compliant", "unresolved",
-              "numeric_mismatch", "length_capped", "response_tokens", "proxy", "count", "training_rollout_kl"]
+              "numeric_mismatch", "length_capped", "response_tokens", "proxy", "graded_count", "failed_count", "count", "training_rollout_kl"]
     with (folder / "metrics.csv").open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -73,9 +74,7 @@ def write_report(folder, summary):
     for arm in summary["arms"]:
         selected = [r for r in finals if r["arm"] == arm]
         if selected:
-            aggregates[arm] = {field: {"mean": float(np.mean([r[field] for r in selected])),
-                                       "sample_std": float(np.std([r[field] for r in selected], ddof=1)) if len(selected) > 1 else None}
-                               for field in fields[4:-2]}
+            aggregates[arm] = {field: aggregate_present(selected, field) for field in fields[4:-2]}
     for seed in summary["run_seeds"]:
         arms = {r["arm"]: r for r in finals if r["seed"] == seed}
         if "knn4" in arms and "knn30" in arms:
@@ -107,6 +106,9 @@ def write_report(folder, summary):
              "Both memories use identical examples/proxy vectors and fixed retrieval settings. Only teacher grades and teacher normalization differ.",
              "Judge-4B PPO trains the same small policy using the frozen 4B judge's normalized grade plus the common penalties.",
              "All policies use the same numeric evaluator; unresolved answers remain in the denominator.",
+             "Missing proxy grades are excluded from proxy statistics only; graded_count and failed_count report coverage.",
+             "Teacher fitting uses the intersection of valid labels; each fit/coverage.json lists excluded examples.",
+             "Update numbers count scheduled batches. summary.json reports optimized_batches and skipped_batches per arm.",
              "Final teacher grades are not computed. Predicted gaps are not substituted for actual teacher measurements.", "",
              "| Seed | Policy | Cohort | Update | Numeric | Strict | Format | Unresolved | Truncated |",
              "|---|---|---|---|---|---|---|---|---|"]
@@ -134,7 +136,7 @@ def write_report(folder, summary):
                 for arm in (a for a in summary["arms"] if a != "base"):
                     points = initial + sorted([r for r in rows if r["seed"] == seed and r["arm"] == arm and r["cohort"] == "monitor"], key=lambda r: r["update"])
                     ax.plot([r["update"] for r in points], [r[field] for r in points], marker="o", label=arm)
-                ax.set(title=field.replace("_", " "), xlabel="PPO updates", ylim=(0, 1))
+                ax.set(title=field.replace("_", " "), xlabel="Scheduled PPO batches", ylim=(0, 1))
                 ax.legend(fontsize=8)
             fig.suptitle(f"GSM8K teacher comparison — seed {seed}")
             fig.savefig(folder / f"teacher-monitor-{seed}.png", dpi=160)

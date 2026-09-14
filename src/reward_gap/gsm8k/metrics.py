@@ -25,6 +25,12 @@ def _correlation(left, right):
 
 
 def gap_metrics(actual, predicted, *, theta):
+    if len(actual) == 0 and len(predicted) == 0:
+        return {"count": 0, "mae": None, "rmse": None, "r2": None, "auroc": None,
+                "average_precision": None, "precision": None, "recall": None,
+                "positive_prevalence": None, "positives": 0, "predicted_positives": 0,
+                "detector_cutoff": theta, "mse": None, "pearson": None, "spearman": None,
+                "true_positive": 0, "false_positive": 0, "true_negative": 0, "false_negative": 0}
     result = base_metrics(actual, predicted, theta=theta, cutoff=theta)
     actual, predicted = np.asarray(actual, dtype=float), np.asarray(predicted, dtype=float)
     positive, detected = actual > theta, predicted >= theta

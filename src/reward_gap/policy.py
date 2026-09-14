@@ -156,7 +156,10 @@ class PPOActor(torch.nn.Module):
         if sequences.shape[0] != len(prompts) or not torch.equal(sequences[:, :width], batch.input_ids):
             raise PolicyError("Generation did not preserve the input prompt tokens")
         suffix = sequences[:, width:]
-        if not 0 < suffix.shape[1] <= self.generation.max_new_tokens:
+        if suffix.shape[1] == 0:
+            from reward_gap.failures import SampleError
+            raise SampleError("Generation returned no answer tokens")
+        if suffix.shape[1] > self.generation.max_new_tokens:
             raise PolicyError("Generation returned an invalid response length")
         eos = torch.zeros_like(suffix, dtype=torch.bool)
         for token in self.eos_ids:

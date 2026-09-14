@@ -14,19 +14,21 @@ from torch.version import cuda as torch_cuda
 from filelock import FileLock
 
 from reward_gap.artifacts import atomic_write_json
+from reward_gap.failures import SampleError, record_failure
 from reward_gap.calibration import FrozenCalibration
 from reward_gap.experiment import ExperimentResult, FollowupExperiment
 from reward_gap.memory import MemoryContext
 from reward_gap.policy import PPOActor
 from reward_gap.ppo import PPOTrainer, load_policy_checkpoint
 from reward_gap.scorers import ScoreBatch
-from reward_gap.gsm8k.answers import VERSION, evaluate_answer
+from reward_gap.gsm8k.answers import GRADE_PARSER_VERSION, VERSION, evaluate_answer
 from reward_gap.gsm8k.config import GSMConfig
 from reward_gap.gsm8k.data import load_prepared, schedule
 from reward_gap.gsm8k.graders import LanguageGrader, RUBRIC_VERSION
 from reward_gap.gsm8k.memory import QuestionMemory
 from reward_gap.gsm8k.metrics import gap_metrics
 from reward_gap.gsm8k.rewards import MathReward
+from reward_gap.gsm8k.recovery import FAILURE_POLICY, mean_present, score_partial
 
 PROTOCOL = "gsm8k_common_penalties_v1"
 
@@ -68,6 +70,8 @@ class GSMExperiment(FollowupExperiment):
 
     def _open_gsm(self):
         snapshot = {"protocol": getattr(self, "protocol", PROTOCOL), "answer_parser": VERSION, "rubric": RUBRIC_VERSION,
+                    "grade_parser": GRADE_PARSER_VERSION,
+                    "failure_policy": FAILURE_POLICY,
                     "policy_stop_rule": "tokenizer_primary_eos",
                     "config": self.gsm_config.to_dict(), "manifest": self.manifest,
                     "cohorts": {name: [asdict(q) for q in rows] for name, rows in self.cohorts.items()}}
@@ -93,41 +97,95 @@ class GSMExperiment(FollowupExperiment):
         self.proxy.phase = self.judge.phase = name
 
     def _labels(self, actor, cohort, seed, repeats, *, greedy=False):
+        return self._collect_labels(actor, cohort, seed, repeats, greedy=greedy, include_judge=True)
+
+    def _collect_labels(self, actor, cohort, seed, repeats, *, greedy=False, include_judge=False):
         original = actor.generation
         actor.generation = replace(original, do_sample=not greedy)
-        rows, vectors, metadata = [], [], None
+        rows, vectors, failures, metadata = [], [], [], None
         try:
             for sample in range(repeats):
                 for start in range(0, len(self.cohorts[cohort]), self.config.scoring.batch_size):
                     questions = self.cohorts[cohort][start:start + self.config.scoring.batch_size]
                     prompts = [q.prompt() for q in questions]
-                    rollout = actor.generate(prompts, seed=self._seed(seed, f"{cohort}/{sample}/{start}"),
-                                             temperature=1. if greedy else self.settings["policy_temperature"])
-                    pb = self.proxy.score(prompts, rollout.answers, return_embeddings=True)
-                    jb = self.judge.score(prompts, rollout.answers)
-                    expected = tuple(q.id for q in questions)
-                    if rollout.prompt_ids != expected or pb.prompt_ids != expected or jb.prompt_ids != expected:
-                        raise ValueError("GSM8K generation/grading alignment differs")
-                    current = {"proxy": {"source": pb.source, "revision": pb.revision},
-                               "judge": {"source": jb.source, "revision": jb.revision}, "pooling": pb.embedding_pooling}
-                    if metadata is not None and metadata != current:
-                        raise ValueError("Grader identity changed within labeling stage")
-                    metadata = current
-                    if pb.embeddings is None or len(pb.embeddings) != len(questions):
-                        raise ValueError("Missing proxy representations")
-                    vectors.extend(pb.embeddings.tolist())
+                    kwargs = {"seed": self._seed(seed, f"{cohort}/{sample}/{start}"),
+                              "temperature": 1. if greedy else self.settings["policy_temperature"]}
+                    try:
+                        rollout = actor.generate(prompts, **kwargs)
+                        if rollout.prompt_ids != tuple(q.id for q in questions):
+                            raise ValueError("GSM8K generation alignment differs")
+                        generated = list(zip(rollout.answers, rollout.response_lengths, rollout.finish_reasons, strict=True))
+                        generation_errors = [None] * len(prompts)
+                    except (SampleError, TimeoutError) as exc:
+                        # Retry only explicitly recoverable output failures,
+                        # individually so one bad row cannot discard its peers.
+                        record_failure(self.run_dir, phase=self.proxy.phase, cohort=cohort, seed=seed,
+                                       status="generation_retry", error=str(exc),
+                                       prompt_ids=[p.prompt_id for p in prompts])
+                        generated, generation_errors = [], []
+                        for q in questions:
+                            try:
+                                retry = actor.generate([q.prompt()], **{**kwargs,
+                                    "seed": self._seed(seed, f"{cohort}/{sample}/{q.id}/retry")})
+                                if retry.prompt_ids != (q.id,):
+                                    raise ValueError("GSM8K retry generation alignment differs")
+                                generated.append((retry.answers[0], retry.response_lengths[0], retry.finish_reasons[0]))
+                                generation_errors.append(None)
+                            except (SampleError, TimeoutError) as error:
+                                generated.append(("", 0, "failed"))
+                                generation_errors.append(str(error))
+                    usable = [i for i in range(len(generated)) if generation_errors[i] is None]
+                    proxy_results, judge_results, errors = {}, {}, {}
+                    if usable:
+                        selected = [prompts[i] for i in usable]
+                        answers = [generated[i][0] for i in usable]
+                        batches, issues = score_partial(self.proxy, selected, answers, return_embeddings=True)
+                        proxy_results = dict(zip(usable, batches, strict=True))
+                        errors = {i: e for i, e in zip(usable, issues, strict=True) if e}
+                        if include_judge:
+                            batches, issues = score_partial(self.judge, selected, answers)
+                            judge_results = dict(zip(usable, batches, strict=True))
+                            errors.update({i: e for i, e in zip(usable, issues, strict=True) if e})
                     for i, question in enumerate(questions):
-                        rows.append({"example_id": f"{question.id}/sample-{sample}", "question_id": question.id,
-                                     "question": question.question, "answer": rollout.answers[i],
-                                     "raw_proxy": pb.scores[i], "raw_judge": jb.scores[i],
-                                     "proxy_tokens": pb.token_counts[i], "judge_tokens": jb.token_counts[i],
-                                     "response_tokens": rollout.response_lengths[i], "finish_reason": rollout.finish_reasons[i],
-                                     **evaluate_answer(rollout.answers[i], question.gold, rollout.finish_reasons[i])})
+                        answer, length, reason = generated[i]
+                        row = {"example_id": f"{question.id}/sample-{sample}", "question_id": question.id,
+                               "question": question.question, "answer": answer,
+                               "empty_answer": not bool(answer.strip()),
+                               "response_tokens": length, "finish_reason": reason,
+                               **evaluate_answer(answer, question.gold, reason)}
+                        pb, jb = proxy_results.get(i), judge_results.get(i)
+                        error = generation_errors[i] or errors.get(i)
+                        if error:
+                            row.update(status="failed", error=error, raw_proxy=None, raw_judge=None,
+                                       proxy=None, judge=None, gap=None, high_gap=None, predicted_gap=None)
+                            failures.append(row)
+                            record_failure(self.run_dir, phase=self.proxy.phase, cohort=cohort, seed=seed, **row)
+                            continue
+                        if pb is None or (include_judge and jb is None):
+                            raise ValueError("Grader omitted a result without an explicit failure")
+                        if pb.prompt_ids != (question.id,) or (jb is not None and jb.prompt_ids != (question.id,)):
+                            raise ValueError("GSM8K grading alignment differs")
+                        current = {"proxy": {"source": pb.source, "revision": pb.revision}, "pooling": pb.embedding_pooling}
+                        if jb is not None:
+                            current["judge"] = {"source": jb.source, "revision": jb.revision}
+                            row.update(raw_judge=jb.scores[0], judge_tokens=jb.token_counts[0])
+                        if metadata is not None and metadata != current:
+                            raise ValueError("Grader identity changed within labeling stage")
+                        metadata = current
+                        if pb.embeddings is None or len(pb.embeddings) != 1:
+                            raise ValueError("Missing proxy representations")
+                        row.update(raw_proxy=pb.scores[0], proxy_tokens=pb.token_counts[0], status="ok")
+                        rows.append(row)
+                        vectors.extend(pb.embeddings.tolist())
         finally:
             actor.generation = original
         if metadata is None:
-            raise ValueError("Cannot label an empty cohort")
-        return {"rows": rows, "embeddings": vectors, **metadata}
+            # Evaluation may contain no valid grades; preparation validates
+            # that it still has enough observations to fit its statistics.
+            metadata = {"proxy": {"source": self.proxy.loaded.source, "revision": self.proxy.loaded.revision}, "pooling": None}
+            if include_judge:
+                metadata["judge"] = {"source": self.judge.loaded.source, "revision": self.judge.loaded.revision}
+        return {"rows": rows, "embeddings": vectors, "failed_rows": failures, **metadata}
 
     @staticmethod
     def _batch(data, role):
@@ -137,6 +195,8 @@ class GSMExperiment(FollowupExperiment):
                           data[role]["source"], data[role]["revision"])
 
     def _normalized(self, data, calibration):
+        if not data["rows"]:
+            return data
         zp = calibration.normalize_proxy(self._batch(data, "proxy"))
         zj = calibration.normalize_judge(self._batch(data, "judge"))
         for row, p, j in zip(data["rows"], zp, zj, strict=True):
@@ -159,11 +219,16 @@ class GSMExperiment(FollowupExperiment):
         training = self._normalized(self._labels(actor, "memory", seed, self.settings["preparation_responses"]), calibration)
         self._phase(f"seed-{seed}/selection")
         selection = self._normalized(self._labels(actor, "selection", seed, self.settings["preparation_responses"]), calibration)
+        if not training["rows"] or not selection["rows"]:
+            raise ValueError("Memory fitting needs usable memory and selection labels; see sample_failures.jsonl")
         context = MemoryContext(training["proxy"]["source"], training["proxy"]["revision"], training["pooling"], calibration.calibration_id)
         if selection["pooling"] != context.pooling:
             raise ValueError("Selection and memory representations differ")
         grid, best, best_error = [], None, float("inf")
         for k in sorted(self.settings["k_values"]):
+            if k > len(training["rows"]):
+                grid.append({"k": k, "status": "unavailable", "reason": "Too few usable memory labels"})
+                continue
             for temperature in sorted(self.settings["similarity_temperatures"]):
                 memory = QuestionMemory(training["rows"], torch.tensor(training["embeddings"]), context, k=k, temperature=temperature)
                 predicted, _ = memory.predict(torch.tensor(selection["embeddings"]), [r["question_id"] for r in selection["rows"]], context=context)
@@ -180,22 +245,27 @@ class GSMExperiment(FollowupExperiment):
     def _evaluate_math(self, folder, actor, seed, arm, update, cohort, calibration, memory, theta, kl):
         self._phase(f"seed-{seed}/evaluation/{cohort}/{arm}/{update}")
         data = self._normalized(self._labels(actor, cohort, seed, 1, greedy=True), calibration)
-        context = MemoryContext(data["proxy"]["source"], data["proxy"]["revision"], data["pooling"], calibration.calibration_id)
-        predicted, neighbors = memory.predict(torch.tensor(data["embeddings"]), [r["question_id"] for r in data["rows"]], context=context)
+        context = (MemoryContext(data["proxy"]["source"], data["proxy"]["revision"], data["pooling"], calibration.calibration_id)
+                   if data["rows"] else None)
+        predicted, neighbors = (memory.predict(torch.tensor(data["embeddings"]), [r["question_id"] for r in data["rows"]], context=context)
+                                if data["rows"] else ([], []))
         for row, gap, nearby in zip(data["rows"], predicted, neighbors, strict=True):
             row.update(predicted_gap=gap, neighbors=nearby, high_gap=row["gap"] > theta,
                        format_penalty=self.settings["format_penalty"] * (not row["format_compliant"]),
                        length_penalty=self.settings["length_penalty"] * row["length_capped"])
-        n = len(data["rows"])
+        valid_rows = data["rows"]
+        all_rows = valid_rows + data.get("failed_rows", [])
+        n = len(all_rows)
         fields = ("numeric_match", "strict_match", "format_compliant", "unresolved", "numeric_mismatch",
                   "length_capped", "response_tokens", "proxy", "judge", "gap", "high_gap")
-        scores: dict[str, Any] = {key: sum(row[key] for row in data["rows"]) / n for key in fields}
-        scores.update(count=n, tail_severity=sum(max(0., row["gap"] - theta) for row in data["rows"]) / n,
+        scores: dict[str, Any] = {key: mean_present(all_rows, key) for key in fields}
+        scores.update(count=n, graded_count=len(valid_rows), failed_count=n - len(valid_rows),
+                      tail_severity=sum(max(0., row["gap"] - theta) for row in valid_rows) / len(valid_rows) if valid_rows else None,
                       training_rollout_kl=kl)
         actual = [row["gap"] for row in data["rows"]]
         scores["gap_prediction"] = gap_metrics(actual, predicted, theta=theta)
-        scores["zero_gap"] = gap_metrics(actual, [0.] * n, theta=theta)
-        atomic_write_json(folder / "rows.json", data["rows"])
+        scores["zero_gap"] = gap_metrics(actual, [0.] * len(actual), theta=theta)
+        atomic_write_json(folder / "rows.json", all_rows)
         return {"seed": seed, "arm": arm, "update": update, "cohort": cohort,
                 "theta": theta, "metrics": scores, "rows": str(folder / "rows.json")}
 
@@ -239,9 +309,18 @@ class GSMExperiment(FollowupExperiment):
                 self._phase(f"seed-{seed}/training/{arm}")
                 reward.rows.clear()
                 result = trainer.train(batches, seeds, until_update=trainer.update_count + 1)
+                for metric in result:
+                    if metric.skipped:
+                        record_failure(self.run_dir, phase=f"seed-{seed}/training/{arm}",
+                                       status="batch_skipped", update=metric.update, error=metric.skip_reason,
+                                       prompt_ids=[p.prompt_id for p in batches[metric.update - 1]])
+                        print(f"{arm}: skipped scheduled PPO batch {metric.update}: {metric.skip_reason}", flush=True)
                 history.extend(asdict(row) for row in result)
                 atomic_write_json(metrics_path, history)
                 atomic_write_json(directory / "rollouts" / f"update-{trainer.update_count:06d}.json", reward.rows)
+                if len(history) >= 5 and all(row.get("skipped", False) for row in history[-5:]):
+                    trainer.save_checkpoint(latest, replace_existing=True)
+                    raise ValueError("Five consecutive PPO batches were unusable; see sample_failures.jsonl")
                 boundary = trainer.update_count % self.settings["monitor_every"] == 0
                 if trainer.update_count == self.settings["updates"]:
                     trainer.save_checkpoint(final)
@@ -249,7 +328,12 @@ class GSMExperiment(FollowupExperiment):
                     trainer.save_checkpoint(latest, replace_existing=True)
                 monitor()
             latest.unlink(missing_ok=True)
-            return {"checkpoint": str(final), "metrics": str(metrics_path)}
+            skipped = sum(row.get("skipped", False) for row in history)
+            if skipped == len(history):
+                raise ValueError("No PPO optimization succeeded; see sample_failures.jsonl")
+            return {"checkpoint": str(final), "metrics": str(metrics_path),
+                    "scheduled_batches": len(history), "optimized_batches": len(history) - skipped,
+                    "skipped_batches": skipped}
         finally:
             trainer.release()
 
@@ -311,6 +395,10 @@ class GSMExperiment(FollowupExperiment):
                 results = [entry["result"] for name, entry in self.status["stages"].items()
                            if entry["state"] == "completed" and ("/monitor/" in name or "/final/" in name)]
                 summary = {"schema_version": 1, "protocol": PROTOCOL, "parser": VERSION,
+                           "grade_parser": GRADE_PARSER_VERSION,
+                           "failure_policy": FAILURE_POLICY,
+                           "training": {name: entry["result"] for name, entry in self.status["stages"].items()
+                                        if "/train/" in name and entry["state"] == "completed"},
                            "data_seed": self.settings["data_seed"], "run_seeds": list(self.config.seeds),
                            "test_evaluated": until == "complete" and self.settings["evaluate_test"],
                            "test_limit": self.settings["test_limit"], "results": results}

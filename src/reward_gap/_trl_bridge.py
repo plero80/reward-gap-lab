@@ -4,6 +4,7 @@ from collections import defaultdict, deque
 from types import SimpleNamespace
 
 import torch
+from reward_gap.failures import SampleError
 
 
 class RewardBridge(torch.nn.Module):
@@ -17,11 +18,13 @@ class RewardBridge(torch.nn.Module):
         self.width = 0
         self.records = defaultdict(deque)
         self.batches = []
+        self.sample_failure = None
 
     def bind(self, prompts, batch):
         self.width = batch.input_ids.shape[1]
         self.records.clear()
         self.batches.clear()
+        self.sample_failure = None
         # TRL replaces left-padding IDs with zero before calling the backbone.
         ids = batch.input_ids.masked_fill(~batch.attention_mask.bool(), 0).cpu().tolist()
         for record, row in zip(prompts, ids, strict=True):
@@ -46,11 +49,19 @@ class RewardBridge(torch.nn.Module):
                 expected_mask = torch.arange(len(response_mask), device=mask.device) < len(suffix)
                 if (not torch.equal(response_mask, expected_mask) or not len(suffix)
                         or (reasons[-1] == "length" and len(suffix) != len(response_mask))):
-                    raise ValueError("Unexpected PAD inside a completion; cannot establish its EOS/length status")
+                    error = "Unexpected PAD inside a completion; cannot establish its EOS/length status"
+                    if getattr(self.strategy, "recover_sample_failures", False):
+                        self.sample_failure = SampleError(error)
+                        raise self.sample_failure
+                    raise ValueError(error)
             answers.append(self.tokenizer.decode(suffix.tolist(), skip_special_tokens=True,
                                                  clean_up_tokenization_spaces=False))
-        result = (score_rollouts(records, answers, response_lengths=lengths, finish_reasons=reasons)
-                  if score_rollouts is not None else self.strategy.score(records, answers))
+        try:
+            result = (score_rollouts(records, answers, response_lengths=lengths, finish_reasons=reasons)
+                      if score_rollouts is not None else self.strategy.score(records, answers))
+        except SampleError as exc:
+            self.sample_failure = exc
+            raise
         if result.prompt_ids != tuple(p.prompt_id for p in records) or len(result.rewards) != len(records):
             raise ValueError("Reward results do not match TRL's prompt batch")
         scores = torch.tensor(result.rewards, device=input_ids.device, dtype=torch.float32)

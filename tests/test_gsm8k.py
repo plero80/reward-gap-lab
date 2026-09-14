@@ -11,7 +11,7 @@ import pytest
 torch = pytest.importorskip("torch")
 from reward_gap.artifacts import atomic_write_json
 from reward_gap.calibration import FrozenCalibration, ScoreScale
-from reward_gap.gsm8k.answers import boxed, evaluate_answer, extract, numeric, parse_grade
+from reward_gap.gsm8k.answers import boxed, evaluate_answer, extract, numeric, parse_grade, parse_grade_output
 from reward_gap.gsm8k.config import COHORTS, GSMConfig, load_gsm_config
 from reward_gap.gsm8k.data import Question, PROMPT_VERSION, group, load_prepared, partition, schedule
 from reward_gap.gsm8k.memory import QuestionMemory
@@ -64,10 +64,26 @@ def test_gap_metrics_include_confusion_and_tie_aware_correlations():
 
 
 @pytest.mark.parametrize("text,expected", [("Good work.\nSCORE: 5", 5), ("score: 1\n", 1),
-    ("SCORE: 0", None), ("SCORE: 5\nMore text", None), ("SCORE: 3\nSCORE: 5", None),
-    ("Score is 4", None), ("SCORE: 4.5", None)])
-def test_grade_requires_one_terminal_score(text, expected):
+    ("SCORE: 0", None), ("SCORE: 5\nMore text", 5), ("SCORE: 3\nSCORE: 5", None),
+    ("Score is 4", None), ("SCORE: 4.5", None),
+    ("\n SCORE: 3\n\nExplanation:\n270 skips", 3),
+    ("Explanation\nSCORE: 3\nMore explanation", None),
+    ("SCORE: 3\nRevised SCORE: 4", None),
+    ("SCORE: 3\nSCORE: 9", None), ("SCORE: 3\nSCORE: 3", None),
+    ("SCORE: 3/5\nExplanation", None), ("The answer is 3", None),
+    ("SCORE: 3\nExplanation\nSCORE: unknown", None)])
+def test_grade_requires_one_explicit_boundary_score(text, expected):
     assert parse_grade(text) == expected
+
+
+@pytest.mark.parametrize("text", ["SCORE: 3\nExplanation", "Explanation\nSCORE: 3"])
+def test_incomplete_grading_output_is_not_a_reward(text):
+    assert parse_grade_output(text, complete=False) == (None, "incomplete_output")
+
+
+def test_grade_format_is_auditable():
+    assert parse_grade_output("SCORE: 3\nExplanation") == (3, "leading_score")
+    assert parse_grade_output("Explanation\nSCORE: 3") == (3, "terminal_score")
 
 
 def test_partition_reserves_even_unused_test_questions_and_hides_current_gold():

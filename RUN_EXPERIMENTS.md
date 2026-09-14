@@ -464,6 +464,66 @@ caches and run outputs in artifact storage outside Git.
 | CUDA or out-of-memory error | Read the setup/preflight error first. Verify the GPU/environment and workload size; a successful preflight alone does not test PPO peak memory. |
 | Run protocol/configuration changed | Use a fresh run name for the new experiment; preserve the old results. |
 
+If a grader returns `SCORE: 3` followed by its explanation, use the current
+grading parser (`gsm8k_score_boundary_complete_v2`). It accepts one standalone
+`SCORE: N` line, with an integer from 1 to 5, at either the beginning or end of
+a completed response. It rejects multiple score fields and retries responses
+that hit their token limit without completing. The rubric itself is unchanged.
+Logs/cache entries record `grade_format`, and generation attempts record
+`finish_reason`. Scores are never inferred from the numerical answer.
+
+Runs created before this parser change require a fresh run name. After updating
+the source files on the pod, reuse your installed environment and prepared data:
+
+```bash
+python -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_smoke.json
+```
+
+Only after it passes:
+
+```bash
+python -m reward_gap.cli gsm8k-run --config configs/gsm8k_smoke.json --run-name gsm8k-smoke-02
+```
+
 CPU tests use tiny local models. The commands here describe the implemented
 GPU workflow; this guide does not claim that the full production runs have
 already passed on your GPU.
+
+### Isolated missing answers or grades (GSM8K)
+
+Both GSM8K runners use failure policy `gsm8k_skip_unusable_samples_v1`:
+
+- Malformed or truncated grades retry with the configured grading token budgets.
+  A grading timeout also consumes one of those attempts. If none succeeds, the
+  grade stays missing; it is never replaced with zero or a guessed score.
+- A recoverable generation failure retries the affected batch as individual
+  questions once. Persistently missing generations are recorded. A normal EOS
+  with empty answer text is a real response: the numeric checker marks it unresolved.
+- Calibration and memory use valid paired labels. The 4B/30B comparison keeps
+  the same intersection of examples for both teachers. Their `fit/.../coverage.json`
+  files list exclusions. Fitting still requires enough usable, nonconstant scores
+  and enough neighbors for the chosen memory settings.
+- Evaluation retains every scheduled question. Missing generations count as
+  unresolved/incorrect. Missing grades do not remove valid numeric answers from
+  the accuracy denominator. Grader/gap statistics use valid pairs and report
+  `graded_count` and `failed_count`; unavailable statistics are JSON `null`.
+- During PPO, an ungradable response skips its **whole scheduled batch before
+  optimization**. No policy/value weights or optimizer state are updated. The
+  next scheduled batch continues. This preserves TRL's fixed batch requirements.
+  `metrics.json` marks `skipped`, with `mean_reward: null`, and `summary.json`
+  reports `scheduled_batches`, `optimized_batches`, and `skipped_batches` per arm.
+  Plot/update numbers therefore describe scheduled batches, not successful updates.
+
+Failures are saved in `outputs/<run-name>/sample_failures.jsonl`; raw grader
+attempts remain in `grading_cost.jsonl`. Skips may differ between arms, so check
+their optimized batch counts before interpreting a comparison. Recovery uses
+the existing checkpoint retention policy and adds no per-prompt checkpoints.
+
+CUDA/OOM errors, broken files, invalid configuration and programming errors still
+stop the run. Five consecutive unusable PPO batches stop after saving a recovery
+checkpoint, and a run with no successful PPO optimization cannot report success.
+This prevents a broken grader from consuming the entire budget silently.
+
+Update the project source on the pod, keep the existing environment/data/model
+cache, and rerun preflight. Runs started before this failure policy need a fresh
+run name (for example `gsm8k-smoke-recovery-01`); do not mix old and new results.

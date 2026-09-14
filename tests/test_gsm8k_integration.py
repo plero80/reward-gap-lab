@@ -113,6 +113,74 @@ def test_all_malformed_grades_fail_instead_of_fabricating_reward(loaded, tmp_pat
     assert len(calls) == 2 and not list(tmp_path.glob("grade_cache/*.json"))
 
 
+OBSERVED_LEADING_GRADE = """SCORE: 3
+
+Explanation:
+The candidate's approach correctly calculates the total skips by summing up the individual contributions from both Bob and Jim. However, it mistakenly adds their individual results instead of combining them as required.
+
+Final Result:
+The candidate's calculation is close but misses the mark by adding Bob's and Jim's skips individually rather than combining them. The correct total should be:
+
+Bob: 12 * 10 = 120 skips
+Jim: 15 * 10 = 150 skips
+Total: 120 + 150 = 270 skips
+
+Correct Final Result:
+270 skips"""
+
+
+def test_observed_proxy_output_retries_truncation_then_accepts_completed_leading_score(loaded, tmp_path, monkeypatch):
+    grader, prompt = make_grader(loaded, tmp_path)
+    encoded = loaded.tokenizer.encode(OBSERVED_LEADING_GRADE, add_special_tokens=False)
+    budgets = [len(encoded) - 8, len(encoded) + 10]
+    grader.settings["grading_budgets"] = budgets
+    eos = loaded.tokenizer.eos_token_id
+    loaded.model.generation_config.eos_token_id = eos
+    calls = []
+    def generate(**kwargs):
+        budget = kwargs["generation_config"].max_new_tokens
+        calls.append(budget)
+        suffix = encoded[:budget] if budget == budgets[0] else [*encoded, eos]
+        return torch.cat((kwargs["input_ids"], torch.tensor([suffix])), dim=1)
+    monkeypatch.setattr(loaded.model, "generate", generate)
+    assert grader.score([prompt], ["270"]).scores == (3.,)
+    assert calls == budgets
+    events = [json.loads(line) for line in (tmp_path / "grading_cost.jsonl").read_text().splitlines()]
+    assert events[0]["valid_grade"] is False and events[0]["grade_format"] == "incomplete_output"
+    assert events[0]["finish_reason"] == "length"
+    assert events[1]["valid_grade"] is True and events[1]["grade_format"] == "leading_score"
+    assert events[1]["grading_text"] == OBSERVED_LEADING_GRADE
+    assert events[1]["finish_reason"] == "eos"
+    assert grader.score([prompt], ["270"]).scores == (3.,) and calls == budgets
+    cached = json.loads(next((tmp_path / "grade_cache").glob("*.json")).read_text())
+    assert cached["grade_format"] == "leading_score" and "grade_parser" in cached["key"]
+
+
+def test_grader_accepts_eos_exactly_at_token_budget(loaded, tmp_path, monkeypatch):
+    grader, prompt = make_grader(loaded, tmp_path)
+    eos = loaded.tokenizer.eos_token_id
+    loaded.model.generation_config.eos_token_id = [eos]
+    tokens = loaded.tokenizer.encode("SCORE: 4", add_special_tokens=False) + [eos]
+    grader.settings["grading_budgets"] = [len(tokens)]
+    monkeypatch.setattr(loaded.model, "generate", lambda **kw:
+                        torch.cat((kw["input_ids"], torch.tensor([tokens])), dim=1))
+    assert grader.score([prompt], ["5"]).scores == (4.,)
+
+
+def test_grade_cache_does_not_cross_parser_versions(loaded, tmp_path, monkeypatch):
+    from reward_gap.gsm8k import graders
+    grader, prompt = make_grader(loaded, tmp_path)
+    calls = []
+    def generate(**kw):
+        calls.append(1)
+        return torch.cat((kw["input_ids"], torch.tensor([loaded.tokenizer.encode("SCORE: 4", add_special_tokens=False)])), dim=1)
+    monkeypatch.setattr(loaded.model, "generate", generate)
+    grader.score([prompt], ["5"])
+    monkeypatch.setattr(graders, "GRADE_PARSER_VERSION", "different-parser")
+    grader.score([prompt], ["5"])
+    assert len(calls) == 2 and len(list((tmp_path / "grade_cache").glob("*.json"))) == 2
+
+
 @pytest.fixture
 def setup(loaded, tmp_path):
     original = load_gsm_config(Path(__file__).parents[1] / "configs/gsm8k_smoke.json")
@@ -148,6 +216,21 @@ def setup(loaded, tmp_path):
         return GSMExperiment(cfg or config, config.base.runtime.output_root / "test",
                              actor_factory=actor, scorer_factory=Grader)
     return config, factory, calls
+
+
+def test_old_grading_protocol_requires_new_run_without_loading_models(setup):
+    _, factory, calls = setup
+    experiment = factory()
+    experiment.run_dir.mkdir(parents=True)
+    experiment._open_gsm()
+    path = experiment.run_dir / "resolved_protocol.json"
+    snapshot = json.loads(path.read_text())
+    assert "grade_parser" in snapshot
+    del snapshot["grade_parser"]
+    path.write_text(json.dumps(snapshot))
+    with pytest.raises(ValueError, match="protocol or data changed"):
+        factory()._open_gsm()
+    assert not calls
 
 
 def test_full_native_trl_run_same_initial_weights_and_test_only_after_training(setup, monkeypatch):

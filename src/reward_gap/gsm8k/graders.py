@@ -9,9 +9,10 @@ import torch
 from transformers import GenerationConfig
 
 from reward_gap.artifacts import atomic_write_json
+from reward_gap.failures import SampleError
 from reward_gap.models import LoadOptions, ModelSpec, load_policy_model
 from reward_gap.scorers import ScoreBatch
-from reward_gap.gsm8k.answers import parse_grade
+from reward_gap.gsm8k.answers import GRADE_PARSER_VERSION, parse_grade_output
 
 RUBRIC_VERSION = "gsm8k_grade_1to5_v1"
 POOLING = "gsm8k_grade_1to5_v1_last_input_postnorm_l2"
@@ -48,12 +49,36 @@ class LanguageGrader:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps({"phase": self.phase, "role": self.role, "model": self.loaded.source,
-                                     "revision": self.loaded.revision, **event}, allow_nan=False) + "\n")
+                                     "revision": self.loaded.revision, "grade_parser": GRADE_PARSER_VERSION,
+                                     **event}, allow_nan=False) + "\n")
 
     @torch.no_grad()
     def score(self, prompts, answers, *, return_embeddings=False):
+        results, failures = self.score_partial(prompts, answers, return_embeddings=return_embeddings)
+        if any(failures):
+            raise SampleError(next(error for error in failures if error))
+        return ScoreBatch(tuple(p.prompt_id for p in prompts), tuple(b.scores[0] for b in results),
+                          tuple(b.token_counts[0] for b in results), self.role,
+                          self.loaded.source, self.loaded.revision,
+                          torch.cat([b.embeddings for b in results]) if return_embeddings else None,
+                          POOLING if return_embeddings else None)
+
+    def score_partial(self, prompts, answers, *, return_embeddings=False):
+        """Keep row alignment; missing scores are explicit and never cached as grades."""
         if len(prompts) != len(answers) or not prompts or (return_embeddings and self.role != "proxy"):
             raise ValueError("Invalid grading batch or embedding role")
+        results, failures = [], []
+        for prompt, answer in zip(prompts, answers, strict=True):
+            try:
+                results.append(self._score([prompt], [answer], return_embeddings=return_embeddings))
+                failures.append(None)
+            except SampleError as exc:
+                results.append(None)
+                failures.append(str(exc))
+        return results, failures
+
+    @torch.no_grad()
+    def _score(self, prompts, answers, *, return_embeddings=False):
         scores, lengths, vectors = [], [], []
         for prompt, answer in zip(prompts, answers, strict=True):
             question = self.questions[prompt.prompt_id]
@@ -62,18 +87,19 @@ class LanguageGrader:
                           "reference_solution": question.solution, "candidate": answer}, ensure_ascii=False)}]
             text = self.loaded.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             key_payload = {"text": text, "model": self.loaded.source, "revision": self.loaded.revision,
-                           "budgets": self.settings["grading_budgets"], "rubric_version": RUBRIC_VERSION}
+                           "budgets": self.settings["grading_budgets"], "rubric_version": RUBRIC_VERSION,
+                           "grade_parser": GRADE_PARSER_VERSION}
             key = hashlib.sha256(json.dumps(key_payload, sort_keys=True).encode()).hexdigest()
             cache = self.output_dir / "grade_cache" / f"{key}.json"
             cached = json.loads(cache.read_text()) if cache.is_file() else None
             if cached is not None and (not return_embeddings or cached.get("embedding") is not None):
                 self._event({"cache_hit": True, "question_id": question.id, "input_tokens": 0,
-                             "generated_tokens": 0, "seconds": 0})
+                             "generated_tokens": 0, "seconds": 0, "grade_format": cached["grade_format"]})
             else:
                 inputs = self.loaded.tokenizer(text, return_tensors="pt", add_special_tokens=False).to(self.loaded.model.device)
                 width = inputs["input_ids"].shape[1]
                 if width > self.settings["grading_max_input"] or width + max(self.settings["grading_budgets"]) > self.loaded.model.config.max_position_embeddings:
-                    raise ValueError(f"Grading input exceeds context limits: {question.id}")
+                    raise SampleError(f"Grading input exceeds context limits: {question.id}")
                 embedding = None
                 start = time.perf_counter()
                 if return_embeddings:
@@ -99,21 +125,29 @@ class LanguageGrader:
                                          "input_tokens": width, "generated_tokens": 0, "output_tokens_known": False,
                                          "seconds": time.perf_counter() - start, "valid_grade": False,
                                          "error": str(exc)})
+                            if isinstance(exc, TimeoutError):
+                                continue
                             raise
                         output = self.loaded.tokenizer.decode(tokens, skip_special_tokens=True)
-                        grade = parse_grade(output)
+                        eos = settings.eos_token_id
+                        eos_ids = (eos,) if isinstance(eos, int) else tuple(eos or ())
+                        ended = bool(len(tokens)) and int(tokens[-1]) in eos_ids
+                        complete = ended or len(tokens) < budget
+                        grade, grade_format = parse_grade_output(output, complete=complete)
                         event = {"cache_hit": False, "question_id": question.id, "attempt": attempt + 1,
                                  "input_tokens": width, "generated_tokens": len(tokens),
                                  "seconds": time.perf_counter() - start, "valid_grade": grade is not None,
-                                 "grading_text": output}
+                                 "grading_text": output, "grade_format": grade_format,
+                                 "finish_reason": "eos" if ended else "stopped" if complete else "length"}
                         attempts.append(event)
                         self._event(event)
                         if grade is not None:
                             cached = {"grade": grade, "input_tokens": width, "attempts": attempts,
-                                      "key": key_payload, "embedding": embedding}
+                                      "key": key_payload, "embedding": embedding, "grade_format": grade_format}
                             break
                     if cached is None:
-                        raise ValueError(f"Malformed {self.role} grades after all bounded retries for {question.id}")
+                        raise SampleError(f"Malformed {self.role} grades after all bounded retries for {question.id}; "
+                                         f"see {self.output_dir / 'grading_cost.jsonl'}")
                 elif return_embeddings:
                     cached["embedding"] = embedding
                 atomic_write_json(cache, cached)

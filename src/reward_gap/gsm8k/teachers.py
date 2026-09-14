@@ -9,16 +9,18 @@ import torch
 from filelock import FileLock
 
 from reward_gap.artifacts import atomic_write_json
+from reward_gap.failures import record_failure
 from reward_gap.calibration import FrozenCalibration
 from reward_gap.config import ModelReference
 from reward_gap.experiment import ExperimentResult
 from reward_gap.ppo import load_policy_checkpoint
-from reward_gap.gsm8k.answers import VERSION, evaluate_answer
+from reward_gap.gsm8k.answers import GRADE_PARSER_VERSION, VERSION, evaluate_answer
 from reward_gap.gsm8k.experiment import GSMExperiment, read
 from reward_gap.gsm8k.graders import LanguageGrader
 from reward_gap.gsm8k.memory import QuestionMemory
 from reward_gap.gsm8k.metrics import gap_metrics
 from reward_gap.gsm8k.rewards import MathReward
+from reward_gap.gsm8k.recovery import FAILURE_POLICY, mean_present, score_partial
 from reward_gap.memory import MemoryContext
 
 TEACHERS = ("4b", "30b")
@@ -83,35 +85,7 @@ class TeacherExperiment(GSMExperiment):
 
     def _shared(self, actor, cohort, seed, repeats, *, greedy=False):
         """Generate once; never use a teacher to generate replacement answers."""
-        original = actor.generation
-        actor.generation = replace(original, do_sample=not greedy)
-        rows, vectors, metadata = [], [], None
-        try:
-            for sample in range(repeats):
-                for start in range(0, len(self.cohorts[cohort]), self.config.scoring.batch_size):
-                    questions = self.cohorts[cohort][start:start + self.config.scoring.batch_size]
-                    prompts = [q.prompt() for q in questions]
-                    rollout = actor.generate(prompts, seed=self._seed(seed, f"{cohort}/{sample}/{start}"),
-                                             temperature=1. if greedy else self.settings["policy_temperature"])
-                    batch = self.proxy.score(prompts, rollout.answers, return_embeddings=True)
-                    if rollout.prompt_ids != tuple(q.id for q in questions) or batch.prompt_ids != rollout.prompt_ids or batch.embeddings is None:
-                        raise ValueError("Shared policy/proxy alignment differs")
-                    current = {"proxy": {"source": batch.source, "revision": batch.revision}, "pooling": batch.embedding_pooling}
-                    if metadata is not None and metadata != current:
-                        raise ValueError("Shared proxy representation changed")
-                    metadata = current
-                    vectors.extend(batch.embeddings.tolist())
-                    for i, q in enumerate(questions):
-                        rows.append({"example_id": f"{q.id}/sample-{sample}", "question_id": q.id,
-                                     "question": q.question, "answer": rollout.answers[i],
-                                     "raw_proxy": batch.scores[i], "proxy_tokens": batch.token_counts[i],
-                                     "response_tokens": rollout.response_lengths[i], "finish_reason": rollout.finish_reasons[i],
-                                     **evaluate_answer(rollout.answers[i], q.gold, rollout.finish_reasons[i])})
-        finally:
-            actor.generation = original
-        if metadata is None:
-            raise ValueError("Cannot label an empty cohort")
-        return {"rows": rows, "embeddings": vectors, **metadata}
+        return self._collect_labels(actor, cohort, seed, repeats, greedy=greedy, include_judge=False)
 
     def _save_shared(self, folder, actor, cohort, seed):
         self._phase(f"seed-{seed}/shared/{cohort}")
@@ -127,12 +101,19 @@ class TeacherExperiment(GSMExperiment):
         for start in range(0, len(shared["rows"]), self.config.scoring.batch_size):
             chunk = shared["rows"][start:start + self.config.scoring.batch_size]
             prompts = [self.questions[r["question_id"]].prompt() for r in chunk]
-            batch = teacher.score(prompts, [r["answer"] for r in chunk])
-            if (batch.prompt_ids != tuple(p.prompt_id for p in prompts) or batch.role != "judge"
-                    or {"source": batch.source, "revision": batch.revision} != identity):
-                raise ValueError("Teacher changed input alignment or model identity")
-            for row, grade, tokens in zip(chunk, batch.scores, batch.token_counts, strict=True):
-                rows.append({**row, "raw_judge": grade, "judge_tokens": tokens, "teacher": name, "teacher_identity": identity})
+            batches, errors = score_partial(teacher, prompts, [r["answer"] for r in chunk])
+            for row, batch, error in zip(chunk, batches, errors, strict=True):
+                if error:
+                    rows.append({**row, "raw_judge": None, "judge_tokens": None,
+                                 "teacher": name, "teacher_identity": identity, "grading_error": error})
+                    record_failure(self.run_dir, phase=teacher.phase, teacher=name, error=error,
+                                   **{**row, "status": "failed"})
+                    continue
+                if (batch.prompt_ids != (row["question_id"],) or batch.role != "judge"
+                        or {"source": batch.source, "revision": batch.revision} != identity):
+                    raise ValueError("Teacher changed input alignment or model identity")
+                rows.append({**row, "raw_judge": batch.scores[0], "judge_tokens": batch.token_counts[0],
+                             "teacher": name, "teacher_identity": identity})
         path = atomic_write_json(folder / "grades.json", {"shared": str(shared_path), "judge": identity, "rows": rows})
         return {"grades": str(path)}
 
@@ -145,7 +126,18 @@ class TeacherExperiment(GSMExperiment):
         for original, labeled in zip(shared["rows"], grades["rows"], strict=True):
             if any(labeled.get(key) != value for key, value in original.items()):
                 raise ValueError("Teacher labels changed a shared response or proxy score")
-        return {**shared, "rows": grades["rows"], "judge": grades["judge"]}
+        # Filter both teachers to the same examples, preserving vector order.
+        usable = {r["example_id"] for r in grades["rows"] if r["raw_judge"] is not None}
+        for other in TEACHERS:
+            path = self.status["stages"][f"seed-{seed}/labels/{other}/{cohort}"]["result"]["grades"]
+            other_grades = read(path)
+            if other_grades["shared"] != grades["shared"]:
+                raise ValueError("Teachers labeled different shared artifacts")
+            usable &= {r["example_id"] for r in other_grades["rows"] if r["raw_judge"] is not None}
+        selected = [i for i, r in enumerate(grades["rows"]) if r["example_id"] in usable]
+        return {**shared, "rows": [grades["rows"][i] for i in selected],
+                "embeddings": [shared["embeddings"][i] for i in selected], "judge": grades["judge"],
+                "excluded_ids": [r["example_id"] for r in grades["rows"] if r["example_id"] not in usable]}
 
     def _fit_teacher(self, folder, seed, name):
         calibration_data = self._joined(seed, name, "calibration")
@@ -159,14 +151,20 @@ class TeacherExperiment(GSMExperiment):
         memory = QuestionMemory(data["rows"], torch.tensor(data["embeddings"]), context,
                                 k=comparison["k"], temperature=comparison["temperature"])
         calibration.save(folder / "calibration.json")
+        coverage = {}
+        for cohort in PREPARATION:
+            joined = self._joined(seed, name, cohort)
+            coverage[cohort] = {"included_count": len(joined["rows"]), "excluded_ids": joined["excluded_ids"],
+                                "failed_shared_ids": [r["example_id"] for r in joined.get("failed_rows", [])]}
+        atomic_write_json(folder / "coverage.json", coverage)
         atomic_write_json(folder / "memory.json", memory.to_dict())
         diagnostics = {}
         for cohort in ("selection", "monitor"):
             held = self._normalized(self._joined(seed, name, cohort), calibration)
-            if held["pooling"] != context.pooling:
+            if held["rows"] and held["pooling"] != context.pooling:
                 raise ValueError("Held-out representation differs from memory")
-            predictions, neighbors = memory.predict(torch.tensor(held["embeddings"]),
-                [r["question_id"] for r in held["rows"]], context=context)
+            predictions, neighbors = (memory.predict(torch.tensor(held["embeddings"]),
+                [r["question_id"] for r in held["rows"]], context=context) if held["rows"] else ([], []))
             for row, gap, nearby in zip(held["rows"], predictions, neighbors, strict=True):
                 row.update(predicted_gap=gap, corrected_reward=row["proxy"] - gap, neighbors=nearby)
             diagnostics[cohort] = {"gap_prediction": gap_metrics([r["gap"] for r in held["rows"]], predictions, theta=theta),
@@ -239,12 +237,14 @@ class TeacherExperiment(GSMExperiment):
     def _evaluate_math(self, folder, actor, seed, arm, update, cohort, calibration, memory, theta, kl):
         self._phase(f"seed-{seed}/evaluation/{cohort}/{arm}/{update}")
         data = self._shared(actor, cohort, seed, 1, greedy=True)
-        proxy = calibration.normalize_proxy(self._batch(data, "proxy"))
+        proxy = calibration.normalize_proxy(self._batch(data, "proxy")) if data["rows"] else []
         for row, score in zip(data["rows"], proxy, strict=True):
             row.update(proxy=score, predicted_gaps={}, corrected_rewards={})
         for teacher, (cal, mem, _) in self.preparations[seed].items():
-            context = MemoryContext(data["proxy"]["source"], data["proxy"]["revision"], data["pooling"], cal.calibration_id)
-            gaps, neighbors = mem.predict(torch.tensor(data["embeddings"]), [r["question_id"] for r in data["rows"]], context=context)
+            context = (MemoryContext(data["proxy"]["source"], data["proxy"]["revision"], data["pooling"], cal.calibration_id)
+                       if data["rows"] else None)
+            gaps, neighbors = (mem.predict(torch.tensor(data["embeddings"]), [r["question_id"] for r in data["rows"]], context=context)
+                               if data["rows"] else ([], []))
             for row, gap, nearby in zip(data["rows"], gaps, neighbors, strict=True):
                 row["predicted_gaps"][teacher] = gap
                 row["corrected_rewards"][teacher] = row["proxy"] - gap
@@ -252,10 +252,13 @@ class TeacherExperiment(GSMExperiment):
         for row in data["rows"]:
             row.update(format_penalty=self.settings["format_penalty"] * (not row["format_compliant"]),
                        length_penalty=self.settings["length_penalty"] * row["length_capped"])
+        valid_count = len(data["rows"])
+        data["rows"] += data.get("failed_rows", [])
         fields = ("numeric_match", "strict_match", "format_compliant", "unresolved", "numeric_mismatch",
                   "length_capped", "response_tokens", "proxy")
-        scores: dict[str, Any] = {key: float(np.mean([row[key] for row in data["rows"]])) for key in fields}
-        scores.update(count=len(data["rows"]), training_rollout_kl=kl)
+        scores: dict[str, Any] = {key: mean_present(data["rows"], key) for key in fields}
+        scores.update(count=len(data["rows"]), graded_count=valid_count, failed_count=len(data["rows"]) - valid_count,
+                      training_rollout_kl=kl)
         atomic_write_json(folder / "rows.json", data["rows"])
         return {"seed": seed, "arm": arm, "update": update, "cohort": cohort, "metrics": scores,
                 "rows": str(folder / "rows.json"), "teacher_grades": "not_computed"}
@@ -320,7 +323,11 @@ class TeacherExperiment(GSMExperiment):
                             del actor
                 results = [r["result"] for name, r in self.status["stages"].items()
                            if r["state"] == "completed" and ("/monitor/" in name or "/final/" in name)]
-                summary = {"protocol": self.protocol, "parser": VERSION, "run_seeds": list(self.config.seeds),
+                summary = {"protocol": self.protocol, "parser": VERSION, "grade_parser": GRADE_PARSER_VERSION,
+                           "failure_policy": FAILURE_POLICY,
+                           "training": {name: entry["result"] for name, entry in self.status["stages"].items()
+                                        if "/train/" in name and entry["state"] == "completed"},
+                           "run_seeds": list(self.config.seeds),
                            "arms": ["base", *ARMS],
                            "data_seed": self.settings["data_seed"], "results": results,
                            "teachers": {n: self.status["models"][f"teacher-{n}"] for n in TEACHERS},

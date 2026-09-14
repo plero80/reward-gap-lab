@@ -23,6 +23,7 @@ from reward_gap.policy import PPOActor, _seeded
 from reward_gap.formatting import format_policy_batch
 from reward_gap._trl_bridge import RewardBridge, RewardModel, ValueModel
 from reward_gap.rewards import RewardBatch
+from reward_gap.failures import SampleError
 
 
 class PPOError(ValueError):
@@ -87,11 +88,14 @@ class RewardStrategy(Protocol):
 
 @dataclass(frozen=True)
 class UpdateMetrics:
+    """A scheduled batch; skipped batches have no optimizer step or mean reward."""
     update: int
     prompt_position: int
     rollout_seed: int
-    mean_reward: float
+    mean_reward: float | None
     library_metrics: dict[str, float]
+    skipped: bool = False
+    skip_reason: str | None = None
 
 
 class PPOTrainer:
@@ -238,6 +242,17 @@ class PPOTrainer:
                     self._backend.train()
             if any(not torch.isfinite(p).all() for p in self._parameters.values()):
                 raise PPOError("TRL produced nonfinite trainable parameters")
+        except SampleError as exc:
+            # Our one-batch TRL call scores all rollouts before any optimizer
+            # step. Only failures originating in that bridge may be skipped.
+            if self._bridge.sample_failure is not exc or not getattr(self.reward, "recover_sample_failures", False):
+                self._failed = True
+                raise
+            self.update_count += 1
+            self.prompt_position += len(prompts)
+            self._bridge.sample_failure = None
+            return UpdateMetrics(self.update_count, self.prompt_position, rollout_seed,
+                                 None, {}, skipped=True, skip_reason=str(exc))
         except BaseException:
             self._failed = True
             raise
@@ -255,7 +270,7 @@ class PPOTrainer:
 
     def train(self, prompt_batches: Sequence[Sequence[PromptRecord]], rollout_seeds: Sequence[int], *,
               checkpoint_dir: str | Path | None = None, until_update: int | None = None) -> list[UpdateMetrics]:
-        """Run a full fixed schedule, resuming at update_count; optionally pause early."""
+        """Run a fixed schedule; update_count includes explicitly skipped batches."""
         if len(prompt_batches) != self.config.total_updates or len(rollout_seeds) != len(prompt_batches):
             raise PPOError("Provide the full prompt and seed schedule for total_updates")
         if any(len(batch) != self.config.rollout_batch_size for batch in prompt_batches):

@@ -4,6 +4,7 @@ import re
 from fractions import Fraction
 
 VERSION = "gsm8k_followup_numeric_v1"
+GRADE_PARSER_VERSION = "gsm8k_score_boundary_complete_v2"
 NUMBER = r"[+-]?(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 
 
@@ -64,7 +65,28 @@ def evaluate_answer(text: str, gold: str, finish_reason: str) -> dict:
             "numeric_mismatch": predicted is not None and not match, "length_capped": finish_reason == "length"}
 
 
+def parse_grade_output(text: str, *, complete: bool = True) -> tuple[int | None, str]:
+    """Accept one explicit score on the first or last nonempty line.
+
+    A leading score is used only after generation completes: a truncated
+    explanation could still revise it. Never infer a grade from other numbers.
+    """
+    if not complete:
+        return None, "incomplete_output"
+    # Count even malformed/inline score fields, so a second conflicting field
+    # cannot disappear merely because its value is outside the 1..5 range.
+    if len(re.findall(r"(?i)\bSCORE\s*:", text)) != 1:
+        return None, "missing_or_multiple_score_fields"
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return None, "missing_or_multiple_score_fields"
+    for line, kind in ((lines[-1], "terminal_score"), (lines[0], "leading_score")):
+        match = re.fullmatch(r"SCORE:\s*([1-5])", line, flags=re.IGNORECASE)
+        if match:
+            return int(match[1]), kind
+    return None, "invalid_score_format"
+
+
 def parse_grade(text: str) -> int | None:
-    matches = re.findall(r"(?im)^\s*SCORE:\s*([1-5])\s*$", text)
-    terminal = re.search(r"(?i)(?:^|\n)\s*SCORE:\s*([1-5])\s*$", text)
-    return int(terminal[1]) if terminal and len(matches) == 1 else None
+    """Parse complete grading text; generation callers must check completion."""
+    return parse_grade_output(text)[0]

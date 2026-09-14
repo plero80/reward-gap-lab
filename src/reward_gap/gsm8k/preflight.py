@@ -45,6 +45,10 @@ def preflight(config):
                 try:
                     teacher.phase = "preflight"
                     checked[name] = experiment._grade_shared(folder / name, teacher, name, shared["shared"])
+                    from reward_gap.gsm8k.experiment import read
+                    grades = read(checked[name]["grades"])["rows"]
+                    if not any(row["raw_judge"] is not None for row in grades):
+                        raise ValueError(f"No usable {name} grades in preflight; see sample_failures.jsonl")
                 finally:
                     del teacher
                     release_models()
@@ -55,7 +59,9 @@ def preflight(config):
         experiment.cohorts["calibration"] = experiment.cohorts["calibration"][:2]
         experiment._phase("preflight")
         data = experiment._labels(actor, "calibration", config.base.seeds[0], 1)
-        report.update(state="passed", examples=data["rows"], models=experiment.status["models"],
+        if not data["rows"]:
+            raise ValueError("No usable paired grades in preflight; see sample_failures.jsonl")
+        report.update(state="passed", examples=data["rows"], failed_examples=data["failed_rows"], models=experiment.status["models"],
                       note="Inference passed; PPO optimization and peak training memory still require the smoke run.")
     except Exception as exc:
         report.update(state="failed", error=str(exc))

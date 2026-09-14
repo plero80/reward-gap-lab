@@ -4,9 +4,11 @@ from types import SimpleNamespace
 
 from reward_gap.gsm8k.answers import boxed
 from reward_gap.memory import MemoryContext
+from reward_gap.failures import SampleError
 
 
 class MathReward:
+    recover_sample_failures = True
     def __init__(self, arm, proxy, judge, calibration, memory, settings):
         if arm not in ("proxy", "judge", "knn"):
             raise ValueError("Unknown GSM8K PPO arm")
@@ -21,7 +23,14 @@ class MathReward:
         if any(len(values) != len(prompts) for values in (answers, response_lengths, finish_reasons)):
             raise ValueError("Rollout metadata does not align")
         scorer = self.judge if self.arm == "judge" else self.proxy
-        batch = scorer.score(prompts, answers, return_embeddings=self.arm == "knn")
+        try:
+            batch = scorer.score(prompts, answers, return_embeddings=self.arm == "knn")
+        except SampleError as exc:
+            self.rows.extend({"question_id": p.prompt_id, "answer": a, "arm": self.arm,
+                              "response_tokens": n, "finish_reason": reason,
+                              "reward": None, "status": "batch_skipped", "error": str(exc)}
+                             for p, a, n, reason in zip(prompts, answers, response_lengths, finish_reasons, strict=True))
+            raise
         if batch.prompt_ids != tuple(p.prompt_id for p in prompts):
             raise ValueError("Grader changed prompt alignment")
         task = list(self.calibration.normalize_judge(batch) if self.arm == "judge" else self.calibration.normalize_proxy(batch))

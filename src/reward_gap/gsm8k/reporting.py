@@ -7,6 +7,7 @@ from collections import defaultdict
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from reward_gap.gsm8k.recovery import aggregate_present
 
 
 def write_report(folder, summary):
@@ -24,9 +25,7 @@ def write_report(folder, summary):
     for arm in ("base", "proxy", "judge", "knn"):
         arm_rows = [r for r in finals if r["arm"] == arm]
         if arm_rows:
-            aggregates[arm] = {field: {"mean": float(np.mean([r[field] for r in arm_rows])),
-                                       "sample_std": float(np.std([r[field] for r in arm_rows], ddof=1)) if len(arm_rows) > 1 else None}
-                               for field in fields}
+            aggregates[arm] = {field: aggregate_present(arm_rows, field) for field in fields}
     paired = []
     for seed in summary["run_seeds"]:
         arms = {r["arm"]: r for r in finals if r["seed"] == seed}
@@ -53,12 +52,14 @@ def write_report(folder, summary):
     summary["grading_cost"] = dict(costs)
     lines = ["# GSM8K Experiment 2", "", f"Protocol: `{summary['protocol']}`; numeric checker: `{summary['parser']}`.",
              "Numeric-match rate is the primary endpoint. All responses, including unresolved cases, remain in the denominator.",
+             "Missing grades are excluded only from grader/gap statistics; graded_count and failed_count give coverage.",
+             "Update numbers count scheduled PPO batches. summary.json reports optimized_batches and skipped_batches per arm.",
              "Numeric matching does not certify reasoning. This new checker is not the historical post-hoc checker.", "",
              "| Seed | Arm | Cohort | Update | Numeric | Strict | Format | Unresolved | Truncated | Proxy z | Judge z | High gap |",
              "|---|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         values = [str(r[k]) for k in ("seed", "arm", "cohort", "update")]
-        values.extend(f"{r[k]:.4f}" for k in ("numeric_match", "strict_match", "format_compliant", "unresolved", "length_capped", "proxy", "judge", "high_gap"))
+        values.extend(f"{r[k]:.4f}" if r[k] is not None else "N/A" for k in ("numeric_match", "strict_match", "format_compliant", "unresolved", "length_capped", "proxy", "judge", "high_gap"))
         lines.append("| " + " | ".join(values) + " |")
     lines.extend(["", "![Development trajectories](monitor.png)", "",
                   "Per-seed results, final means/sample standard deviations, paired kNN-minus-proxy differences,",
@@ -83,7 +84,7 @@ def write_report(folder, summary):
             for arm in ("proxy", "judge", "knn"):
                 data = [baseline] + sorted([r for r in rows if r["seed"] == seed and r["arm"] == arm and r["cohort"] == "monitor"], key=lambda r: r["update"])
                 ax.plot([r["update"] for r in data], [r[field] for r in data], marker="o", label=arm)
-            ax.set(title=labels[field], xlabel="PPO updates")
+            ax.set(title=labels[field], xlabel="Scheduled PPO batches")
             if field not in ("proxy", "judge"):
                 ax.set_ylim(0, 1)
             ax.legend(fontsize=8)
