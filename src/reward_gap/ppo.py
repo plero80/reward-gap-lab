@@ -8,7 +8,7 @@ from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from importlib.metadata import version
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import torch
 import numpy as np
@@ -118,10 +118,12 @@ class PPOTrainer:
             push_to_hub=False,
         )
         dataset = Dataset.from_dict({"input_ids": batch.input_ids.cpu().tolist()})
+        # TRL annotates these as PreTrainedModel, but accepts PEFT models and
+        # the nn.Module adapters implementing its backbone/score interface.
         self._backend = TRLTrainer(
-            args=args, processing_class=self.actor.tokenizer, model=self.actor.model,
-            ref_model=None, reward_model=RewardModel(self._bridge),
-            value_model=ValueModel(self.actor), train_dataset=dataset, eval_dataset=dataset,
+            args=args, processing_class=self.actor.tokenizer, model=cast(Any, self.actor.model),
+            ref_model=None, reward_model=cast(Any, RewardModel(self._bridge)),
+            value_model=cast(Any, ValueModel(self.actor)), train_dataset=dataset, eval_dataset=dataset,
             optimizers=(self.optimizer, torch.optim.lr_scheduler.LambdaLR(self.optimizer, lambda _: 1.)),
         )
         if self._backend.accelerator.num_processes != 1:
@@ -237,8 +239,10 @@ class PPOTrainer:
                               "size": len(self.actor.tokenizer)},
                 "packages": {name: version(name) for name in ("torch", "transformers", "peft", "trl", "accelerate", "numpy")}}
 
-    def save_checkpoint(self, path: str | Path) -> Path:
-        """Atomically publish complete training state; refuse to replace a checkpoint."""
+    def save_checkpoint(self, path: str | Path, *, replace_existing: bool = False) -> Path:
+        """Publish complete state; opt into atomic replacement for rolling recovery only."""
+        if type(replace_existing) is not bool:
+            raise PPOError("replace_existing must be boolean")
         if self._failed:
             raise PPOError("Cannot checkpoint a partially failed update")
         payload = {"schema_version": 2, "identity": self._identity(),
@@ -248,7 +252,8 @@ class PPOTrainer:
                    "trainer_seed": self.seed, "torch_rng": torch.get_rng_state(),
                    "scheduler": self._backend.lr_scheduler.state_dict() if self._backend else getattr(self, "_pending_scheduler", None),
                    "python_rng": random.getstate(),
-                   "cuda_rng": torch.cuda.get_rng_state_all() if self.actor.device.type == "cuda" else []}
+                   "cuda_rng": torch.cuda.get_rng_state_all() if self.actor.device.type == "cuda" else [],
+                   "forked_from": getattr(self, "forked_from", None)}
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         handle, name = tempfile.mkstemp(dir=destination.parent, prefix=".ppo-", suffix=".tmp")
@@ -257,7 +262,10 @@ class PPOTrainer:
                 torch.save(payload, stream)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.link(name, destination)
+            if replace_existing:
+                os.replace(name, destination)
+            else:
+                os.link(name, destination)
         finally:
             Path(name).unlink(missing_ok=True)
         return destination
@@ -265,10 +273,28 @@ class PPOTrainer:
     def load_checkpoint(self, path: str | Path) -> None:
         """Resume into an independently loaded, matching base model and reward setup."""
         payload = torch.load(path, map_location="cpu", weights_only=True)
+        self._restore_checkpoint(payload)
+
+    def fork_checkpoint(self, path: str | Path, *, expected_reward_id: str) -> None:
+        """Explicitly fork a known source reward into this trainer's target reward.
+
+        All other identities, trainable weights, optimizer/scheduler and progress
+        are restored exactly as for ordinary resume. This does not train or save.
+        """
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        self._restore_checkpoint(payload, expected_reward_id=expected_reward_id)
+        self.forked_from = {"checkpoint": str(Path(path).resolve()), "reward_id": expected_reward_id}
+
+    def _restore_checkpoint(self, payload: dict, *, expected_reward_id: str | None = None) -> None:
         if (not isinstance(payload, dict) or type(payload.get("schema_version")) is not int
                 or payload.get("schema_version") != 2):
             raise PPOError("Unsupported checkpoint schema")
-        if payload.get("identity") != self._identity():
+        expected = self._identity()
+        if expected_reward_id is not None:
+            if not isinstance(expected_reward_id, str) or not expected_reward_id.strip():
+                raise PPOError("Provide the expected source reward identity for a fork")
+            expected["reward_id"] = expected_reward_id
+        if payload.get("identity") != expected:
             raise PPOError("Checkpoint configuration, model or experiment/reward identity differs")
         update, position = payload.get("update"), payload.get("prompt_position")
         if (type(update) is not int or not 0 <= update <= self.config.total_updates
@@ -311,9 +337,25 @@ class PPOTrainer:
                     raise PPOError("Checkpoint CUDA device count differs")
                 torch.cuda.set_rng_state_all(payload["cuda_rng"])
             self._schedule = payload["schedule"]
+            self.forked_from = payload.get("forked_from")
             self.update_count, self.prompt_position = update, position
             self.optimizer.zero_grad(set_to_none=True)
             self._failed = False
         except BaseException:
             self._failed = True
             raise
+
+    def release(self) -> None:
+        """Release trainer/optimizer resources after a coordinator stage is saved.
+
+        The caller may retain the actor. This trainer must not be reused without
+        restoring a checkpoint; optimizer moments have been released.
+        """
+        if self._backend is not None:
+            self._backend.accelerator.free_memory()
+            self._backend = None
+        self.optimizer.state.clear()
+        directory = getattr(self, "_runtime_directory", None)
+        if directory is not None:
+            directory.cleanup()
+        self._failed = True

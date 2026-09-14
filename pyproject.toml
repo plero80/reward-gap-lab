@@ -13,7 +13,7 @@ dependencies = []
 [project.optional-dependencies]
 test = ["pytest>=8"]
 models = ["torch==2.14.0", "transformers==5.17.0", "peft==0.20.0"]
-training = ["reward-gap-lab[models]", "trl==0.29.1", "accelerate==1.15.0", "datasets==5.0.1", "numpy==2.5.3"]
+training = ["reward-gap-lab[models]", "trl==0.29.1", "accelerate==1.15.0", "datasets==5.0.1", "numpy==2.5.3", "filelock==3.32.3"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

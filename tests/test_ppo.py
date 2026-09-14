@@ -187,6 +187,43 @@ def test_legacy_checkpoint_is_explicitly_rejected(loaded, tmp_path):
         trainer(loaded).load_checkpoint(path)
 
 
+def test_explicit_reward_fork_preserves_weights_optimizer_and_progress(loaded, tmp_path):
+    source = trainer(loaded)
+    source.update(prompts(), rollout_seed=7)
+    path = source.save_checkpoint(tmp_path / "round1.pt")
+    target = trainer(loaded)
+    target.reward_id = "knn-new-memory"
+    with pytest.raises(PPOError, match="identity differs"):
+        target.load_checkpoint(path)
+    with pytest.raises(PPOError, match="identity differs"):
+        target.fork_checkpoint(path, expected_reward_id="wrong-source")
+    target.fork_checkpoint(path, expected_reward_id=source.reward_id)
+    assert target.reward_id == "knn-new-memory"
+    assert target.update_count == source.update_count == 1
+    assert target.prompt_position == source.prompt_position
+    assert_state_equal(target.actor.state_dict(), source.actor.state_dict())
+    assert_state_equal(target.optimizer.state_dict(), source.optimizer.state_dict())
+    assert target.forked_from["reward_id"] == source.reward_id
+
+
+def test_rolling_checkpoint_replaces_only_after_success(loaded, tmp_path, monkeypatch):
+    run = trainer(loaded)
+    path = run.save_checkpoint(tmp_path / "latest.pt")
+    original = path.read_bytes()
+    original_save = torch.save
+    def fail(*args, **kwargs):
+        raise OSError("disk full")
+    monkeypatch.setattr(torch, "save", fail)
+    with pytest.raises(OSError, match="disk full"):
+        run.save_checkpoint(path, replace_existing=True)
+    assert path.read_bytes() == original
+    monkeypatch.setattr(torch, "save", original_save)
+    run.update(prompts(), rollout_seed=7)
+    run.save_checkpoint(path, replace_existing=True)
+    assert torch.load(path, weights_only=True)["update"] == 1
+    assert list(tmp_path.iterdir()) == [path]
+
+
 def test_proxy_and_knn_rewards_reach_real_trl(loaded):
     from reward_gap.calibration import FrozenCalibration, ScoreScale
     from reward_gap.memory import GapMemory, MemoryContext

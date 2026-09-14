@@ -46,6 +46,8 @@ def test_defaults_and_paths_do_not_depend_on_working_directory(config_file, monk
     ({"training": {"learning_rate": "0.001"}}, "learning_rate"),
     ({"training": {"learning_rate": float("nan")}}, "learning_rate"),
     ({"training": {"kl_coefficient": -1}}, "kl_coefficient"),
+    ({"memory": {"k": 0}}, "memory.k"),
+    ({"memory": {"temperature": 0}}, "memory.temperature"),
     ({"training": {"ppo_epochs": 0}}, "ppo_epochs"),
     ({"training": {"minibatch_size": 3}}, "minibatch_size"),
     ({"training": {"clip_range": 1}}, "clip_range"),

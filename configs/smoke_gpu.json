@@ -58,6 +58,7 @@
   "policy": {"lora_rank": 8, "lora_alpha": 16, "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]},
   "generation": {"max_prompt_tokens": 512, "max_new_tokens": 256, "do_sample": true},
   "scoring": {"max_tokens": 4096, "batch_size": 4},
+  "memory": {"k": 8, "temperature": 0.1},
   "runtime": {
     "device": "cuda:0",
     "output_root": "outputs",

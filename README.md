@@ -14,8 +14,9 @@ The judge is a reference model, not human ground truth.
 Under construction. Configuration validation, atomic JSON saving, HH-RLHF
 prompt preparation, basic model loading, policy/reward formatting, and frozen
 Qwen3 reward scoring, a Qwen2 LoRA actor with a value head, calibrated reward
-strategies and a TRL-backed PPO trainer are implemented. End-to-end experiment
-orchestration and production GPU validation remain pending.
+strategies, a TRL-backed PPO trainer, evaluation, refresh and the two-round
+experiment coordinator are implemented. Tiny-model end-to-end execution is
+tested; production GPU validation, plots and human review remain pending.
 
 ## Development setup
 
@@ -182,8 +183,8 @@ and length-limit status. Statistics are aligned to each generated token:
 its log probability and the value of the state before that token. Calling
 `statistics()` outside `torch.no_grad()` allows gradients for a future update.
 The reference call temporarily disables LoRA and never records gradients.
-Adapter/value-head checkpoint restoration and optimizer state belong to the
-future PPO training implementation.
+Adapter/value-head checkpoint restoration and optimizer state are handled by
+the TRL integration in ppo.py.
 
 ## Project layout
 
@@ -226,9 +227,44 @@ batch size divisible by minibatch_size, and normalize_advantages=true.
 
 Checkpoints contain LoRA/value weights, optimizer/scheduler state, progress and
 RNG information. Reconstruct the same frozen model and reward artifacts before
-loading. The new format rejects old custom-PPO checkpoints; existing checkpoint
-files cannot be overwritten. CPU tiny-model training and exact resume are
-tested. Production GPU execution and end-to-end orchestration remain pending.
+loading. The new format rejects old custom-PPO checkpoints. Checkpoints refuse
+overwrite by default; the coordinator explicitly replaces only rolling recovery
+files. CPU tiny-model training and exact resume are tested. The coordinator
+supplies end-to-end orchestration; production GPU execution remains pending.
+
+`evaluation.evaluate()` reads a prepared validation or final-evaluation cohort,
+generates answers and saves proxy/judge scores, normalized gaps and generation
+details. Memory predictions and saved embeddings are optional. Evaluation never
+appends examples to memory.
+
+`refresh.refresh_memory()` reads only the prepared refresh cohort, checks its
+disjointness from all other cohorts, generates and labels answers, and saves a
+new extended memory without changing the parent or training policy weights.
+Both operations require absolute paths from the resolved configuration and a
+new output directory. They save evidence rows, a manifest and status.json;
+consumers must require state=completed before using results. A failed stage must
+be rerun into a new directory.
+
+### Run the two-round experiment
+
+After preparing data and installing `.[training]`, run:
+
+```powershell
+.\.venv\Scripts\python.exe -m reward_gap.experiment --config configs/smoke_gpu.json --run-name workshop-01
+```
+
+The coordinator fits or loads calibration and M0, runs proxy-only and static
+round 1, refreshes M1, then runs raw/static/refreshed round 2. It evaluates all
+final policies only after all training finishes and writes `summary.json` under
+the configured output root. Repeating the command resumes compatible saved
+progress; changed settings or prepared inputs require a new run name.
+
+Use `--until round1` or `--until training` to pause at those boundaries. There
+is one rolling recovery checkpoint per branch, replaced at checkpoint_every;
+completed runs retain only the shared corrected round-1 checkpoint and three
+final branch checkpoints per seed. Full frozen model weights are not duplicated.
+Stage attempts and evidence remain available for inspection. The coordinator
+runs branches sequentially and releases trainer resources between stages.
 
 ## Prepare HH-RLHF data
 

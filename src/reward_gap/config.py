@@ -76,6 +76,16 @@ class ScoringConfig:
 
 
 @dataclass(frozen=True)
+class MemoryConfig:
+    k: int = 8
+    temperature: float = 0.1
+
+    def __post_init__(self):
+        _integer(self.k, "memory.k")
+        _number(self.temperature, "memory.temperature")
+
+
+@dataclass(frozen=True)
 class RuntimeConfig:
     device: str = "cpu"
     output_root: Path = Path("outputs")
@@ -126,6 +136,7 @@ class ExperimentConfig:
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
     policy: PolicyConfig = field(default_factory=PolicyConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
     def to_dict(self) -> dict:
         """Return JSON-compatible settings including all resolved defaults."""
@@ -287,5 +298,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
     if len(set(targets)) != len(targets):
         raise ConfigError("policy.target_modules: duplicate modules")
     policy = PolicyConfig(policy.lora_rank, policy.lora_alpha, tuple(targets))
+    memory = MemoryConfig(**_object(raw.get("memory", {}), {f.name for f in fields(MemoryConfig)}, "memory"))
     return ExperimentConfig(1, raw["experiment"], tuple(seeds), training, runtime, data, models,
-                            generation, scoring, policy)
+                            generation, scoring, policy, memory)
