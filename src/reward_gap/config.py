@@ -22,6 +22,32 @@ class TrainingConfig:
     learning_rate: float = 3e-6
     kl_coefficient: float = 0.05
     checkpoint_every: int = 2
+    ppo_epochs: int = 4
+    minibatch_size: int = 1
+    clip_range: float = 0.2
+    value_clip_range: float = 0.2
+    value_coefficient: float = 0.5
+    gamma: float = 1.0
+    gae_lambda: float = 0.95
+    max_grad_norm: float = 1.0
+    normalize_advantages: bool = True
+
+    def __post_init__(self):
+        for name in ("round1_updates", "total_updates", "rollout_batch_size", "checkpoint_every",
+                     "ppo_epochs", "minibatch_size"):
+            _integer(getattr(self, name), f"training.{name}")
+        for name in ("learning_rate", "clip_range", "value_clip_range", "max_grad_norm"):
+            _number(getattr(self, name), f"training.{name}")
+        for name in ("kl_coefficient", "value_coefficient", "gamma", "gae_lambda"):
+            _number(getattr(self, name), f"training.{name}", allow_zero=True)
+        if self.clip_range >= 1 or self.gamma > 1 or self.gae_lambda > 1:
+            raise ConfigError("training: clip_range must be < 1; gamma and gae_lambda must be <= 1")
+        if self.minibatch_size > self.rollout_batch_size:
+            raise ConfigError("training.minibatch_size: must not exceed rollout_batch_size")
+        if type(self.normalize_advantages) is not bool:
+            raise ConfigError("training.normalize_advantages: expected true or false")
+        if self.round1_updates >= self.total_updates:
+            raise ConfigError("training.round1_updates: must be less than total_updates")
 
 
 @dataclass(frozen=True)
@@ -175,13 +201,6 @@ def load_config(path: str | Path) -> ExperimentConfig:
     training = TrainingConfig(**_object(
         raw.get("training", {}), {f.name for f in fields(TrainingConfig)}, "training"
     ))
-    for name in ("round1_updates", "total_updates", "rollout_batch_size", "checkpoint_every"):
-        _integer(getattr(training, name), f"training.{name}")
-    _number(training.learning_rate, "training.learning_rate")
-    _number(training.kl_coefficient, "training.kl_coefficient", allow_zero=True)
-    if training.round1_updates >= training.total_updates:
-        raise ConfigError("training.round1_updates: must be less than total_updates")
-
     runtime = RuntimeConfig(**_object(
         raw.get("runtime", {}), {f.name for f in fields(RuntimeConfig)}, "runtime"
     ))

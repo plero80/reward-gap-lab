@@ -28,7 +28,16 @@
     "rollout_batch_size": 2,
     "learning_rate": 0.000003,
     "kl_coefficient": 0.05,
-    "checkpoint_every": 2
+    "checkpoint_every": 2,
+    "ppo_epochs": 4,
+    "minibatch_size": 1,
+    "clip_range": 0.2,
+    "value_clip_range": 0.2,
+    "value_coefficient": 0.5,
+    "gamma": 1.0,
+    "gae_lambda": 0.95,
+    "max_grad_norm": 1.0,
+    "normalize_advantages": true
   },
   "policy": {"lora_rank": 8, "lora_alpha": 16, "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]},
   "generation": {"max_prompt_tokens": 512, "max_new_tokens": 256, "do_sample": true},

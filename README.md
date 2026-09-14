@@ -207,7 +207,17 @@ on a dedicated calibration cohort. `ProxyReward` returns the normalized proxy
 score; `KNNReward` subtracts the memory's predicted signed gap and returns
 neighbor diagnostics. Both use the frozen proxy without calling the judge
 during reward calculation. Calibration-cohort orchestration, configuration/CLI
-wiring and PPO training remain under construction.
+wiring remain under construction.
+
+`reward_gap.ppo.PPOTrainer` implements sampled rollouts, terminal answer rewards,
+token KL penalties, masked advantages, and clipped policy/value updates on LoRA
+and the value head. Both EOS and the generation limit end an answer. The trainer
+can run a fixed prompt/seed schedule and save resumable checkpoints containing
+trainable weights, optimizer state, RNG states and progress. Reconstruct the same
+frozen model and reward artifacts before loading a checkpoint. Existing
+checkpoint files cannot be overwritten. CPU tiny-model training and exact resume
+are tested; production GPU execution and end-to-end experiment orchestration
+remain pending.
 
 ## Prepare HH-RLHF data
 
