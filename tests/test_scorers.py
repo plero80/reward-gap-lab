@@ -43,6 +43,26 @@ def prompts():
             PromptRecord("long", "hello world", (Message("user", "hello world"),))]
 
 
+def test_real_scorer_integrates_with_both_reward_strategies(loaded):
+    from reward_gap.calibration import FrozenCalibration, ScoreScale
+    from reward_gap.memory import GapMemory, MemoryContext
+    from reward_gap.rewards import KNNReward, ProxyReward
+
+    loaded = replace(loaded, revision="tiny-test-v1")
+    scorer = RewardScorer(loaded, role="proxy")
+    records, answers = prompts(), ["answer", "longer answer"]
+    scored = scorer.score(records, answers, return_embeddings=True)
+    scale = ScoreScale(loaded.source, loaded.revision, 0., 1.)
+    calibration = FrozenCalibration("test-calibration", scale, scale)
+    context = MemoryContext(scored.source, scored.revision, scored.embedding_pooling, calibration.calibration_id)
+    memory = GapMemory(["first", "second"], scored.embeddings, [0.5, -0.25], context=context, k=1)
+    baseline = ProxyReward(scorer, calibration).score(records, answers)
+    corrected = KNNReward(scorer, calibration, memory).score(records, answers)
+    assert baseline.rewards == pytest.approx(scored.scores)
+    assert corrected.rewards == pytest.approx((scored.scores[0] - 0.5, scored.scores[1] + 0.25))
+    assert corrected.neighbors.neighbor_ids == (("first",), ("second",))
+
+
 def test_batched_scores_and_embeddings_match_single_answers(loaded):
     scorer = RewardScorer(loaded, role="proxy", batch_size=2)
     answers = ["answer", "a longer answer"]

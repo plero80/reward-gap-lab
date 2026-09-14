@@ -195,6 +195,20 @@ future PPO training implementation.
 
 See [the planned architecture](docs/architecture.md).
 
+`reward_gap.memory.GapMemory` now builds signed gap memories from proxy
+embeddings and already-normalized proxy/judge scores. It predicts gaps with
+cosine nearest neighbors and temperature weights, returns neighbor diagnostics,
+and creates a new snapshot when examples are appended. Save snapshots under
+`outputs/` using distinct filenames such as `M0.json` and `M1.json`; existing
+files cannot be overwritten. Loading and querying require a matching
+`MemoryContext` (encoder, revision, pooling and calibration identity).
+`FrozenCalibration` fits and saves proxy/judge score normalization constants
+on a dedicated calibration cohort. `ProxyReward` returns the normalized proxy
+score; `KNNReward` subtracts the memory's predicted signed gap and returns
+neighbor diagnostics. Both use the frozen proxy without calling the judge
+during reward calculation. Calibration-cohort orchestration, configuration/CLI
+wiring and PPO training remain under construction.
+
 ## Prepare HH-RLHF data
 
 From the project root, allow the first dataset download explicitly:
