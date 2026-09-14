@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+import math
 from peft import LoraConfig, PeftModel, TaskType, get_peft_model
 from transformers import GenerationConfig as HFGenerationConfig, Qwen2ForCausalLM
 
@@ -125,13 +126,17 @@ class PPOActor(torch.nn.Module):
                    generation=config.generation, seed=seed)
 
     @torch.no_grad()
-    def generate(self, prompts: Sequence[PromptRecord], *, seed: int) -> RolloutBatch:
+    def generate(self, prompts: Sequence[PromptRecord], *, seed: int, temperature: float = 1.0) -> RolloutBatch:
         """Generate once; retain original sampled IDs including the first EOS.
 
-        Sampling uses the full softmax at temperature 1. No inherited Qwen
-        top-k/top-p/repetition penalties alter the distribution used by PPO.
+        Sampling uses the full softmax at the requested temperature (default 1).
+        No inherited Qwen top-k/top-p/repetition penalties alter it. The
+        statistics helpers describe temperature-1 logits; TRL computes its
+        own temperature-adjusted training probabilities.
         Greedy mode is available for evaluation and labeled sampled=False.
         """
+        if isinstance(temperature, bool) or not math.isfinite(temperature) or temperature <= 0:
+            raise PolicyError("Generation temperature must be finite and positive")
         self.model.eval()
         batch = format_policy_batch(
             self.tokenizer, prompts, max_prompt_tokens=self.generation.max_prompt_tokens,
@@ -139,7 +144,7 @@ class PPOActor(torch.nn.Module):
         ).to(self.device)
         settings = HFGenerationConfig(
             max_new_tokens=self.generation.max_new_tokens, do_sample=self.generation.do_sample,
-            top_k=0, top_p=1.0, temperature=1.0, num_beams=1,
+            top_k=0, top_p=1.0, temperature=temperature, num_beams=1,
             eos_token_id=list(self.eos_ids), pad_token_id=self.tokenizer.pad_token_id,
             bos_token_id=self.tokenizer.bos_token_id, use_cache=True,
         )

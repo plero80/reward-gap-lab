@@ -103,7 +103,10 @@ class PPOTrainer:
     """
 
     def __init__(self, actor: PPOActor, reward: RewardStrategy, config: TrainingConfig, *,
-                 experiment_id: str, reward_id: str, seed: int = 42):
+                 experiment_id: str, reward_id: str, seed: int = 42, temperature: float = 1.0):
+        if isinstance(temperature, bool) or not math.isfinite(temperature) or temperature <= 0:
+            raise PPOError("PPO temperature must be finite and positive")
+        self.temperature = float(temperature)
         if not actor.generation.do_sample:
             raise PPOError("PPO requires sampled rollouts; greedy mode is for evaluation")
         if type(seed) is not int or not 0 <= seed < 2**63:
@@ -130,7 +133,7 @@ class PPOTrainer:
             raise PPOError("TRL requires distinct padding and primary EOS tokens")
         self.seed = seed
         self._backend: Any = None
-        self._bridge = RewardBridge(actor.tokenizer, reward)
+        self._bridge = RewardBridge(actor.tokenizer, reward, eos_ids=actor.eos_ids)
         self.update_count = 0
         self.prompt_position = 0
         self._failed = False
@@ -158,7 +161,7 @@ class PPOTrainer:
             total_episodes=cfg.rollout_batch_size,
             local_rollout_forward_batch_size=cfg.rollout_batch_size,
             num_sample_generations=0, response_length=self.actor.generation.max_new_tokens,
-            stop_token="eos", temperature=1., num_ppo_epochs=cfg.ppo_epochs,
+            stop_token="eos", temperature=self.temperature, num_ppo_epochs=cfg.ppo_epochs,
             whiten_rewards=False, kl_coef=cfg.kl_coefficient, kl_estimator="k1",
             cliprange=cfg.clip_range, cliprange_value=cfg.value_clip_range,
             vf_coef=cfg.value_coefficient, gamma=cfg.gamma, lam=cfg.gae_lambda,
@@ -279,6 +282,7 @@ class PPOTrainer:
 
     def _identity(self) -> dict:
         return {"experiment_id": self.experiment_id, "reward_id": self.reward_id,
+                **({"sampling_temperature": self.temperature} if self.temperature != 1.0 else {}),
                 "training": asdict(self.config), "generation": asdict(self.actor.generation),
                 "device": str(self.actor.device), **_policy_identity(self.actor),
                 "packages": {name: version(name) for name in ("torch", "transformers", "peft", "trl", "accelerate", "numpy")}}

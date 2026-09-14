@@ -9,10 +9,11 @@ import torch
 class RewardBridge(torch.nn.Module):
     """Translate TRL's policy-token batches back to original prompt/answer pairs."""
 
-    def __init__(self, tokenizer, strategy):
+    def __init__(self, tokenizer, strategy, *, eos_ids=None):
         super().__init__()
         self.tokenizer = tokenizer
         self.strategy = strategy
+        self.eos_ids = tuple(eos_ids) if eos_ids is not None else (tokenizer.eos_token_id,)
         self.width = 0
         self.records = defaultdict(deque)
         self.batches = []
@@ -27,16 +28,29 @@ class RewardBridge(torch.nn.Module):
             self.records[tuple(row)].append(record)
 
     def forward(self, input_ids, attention_mask, **kwargs):
-        records, answers = [], []
+        records, answers, lengths, reasons = [], [], [], []
+        score_rollouts = getattr(self.strategy, "score_rollouts", None)
         for row, mask in zip(input_ids, attention_mask, strict=True):
             key = tuple(row[:self.width].cpu().tolist())
             if not self.records[key]:
                 raise ValueError("TRL reward input does not match the bound prompt batch")
             records.append(self.records[key].popleft())
             suffix = row[self.width:][mask[self.width:].bool()]
+            lengths.append(len(suffix))
+            reasons.append("eos" if any(suffix.eq(eos).any().item() for eos in self.eos_ids) else "length")
+            if score_rollouts is not None:
+                # Native TRL treats the first PAD as the end of the response.
+                # A sampled PAD inside a completion cannot silently become a
+                # different candidate/length-penalty decision in our adapter.
+                response_mask = mask[self.width:].bool()
+                expected_mask = torch.arange(len(response_mask), device=mask.device) < len(suffix)
+                if (not torch.equal(response_mask, expected_mask) or not len(suffix)
+                        or (reasons[-1] == "length" and len(suffix) != len(response_mask))):
+                    raise ValueError("Unexpected PAD inside a completion; cannot establish its EOS/length status")
             answers.append(self.tokenizer.decode(suffix.tolist(), skip_special_tokens=True,
                                                  clean_up_tokenization_spaces=False))
-        result = self.strategy.score(records, answers)
+        result = (score_rollouts(records, answers, response_lengths=lengths, finish_reasons=reasons)
+                  if score_rollouts is not None else self.strategy.score(records, answers))
         if result.prompt_ids != tuple(p.prompt_id for p in records) or len(result.rewards) != len(records):
             raise ValueError("Reward results do not match TRL's prompt batch")
         scores = torch.tensor(result.rewards, device=input_ids.device, dtype=torch.float32)

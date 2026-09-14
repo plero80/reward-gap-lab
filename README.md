@@ -394,6 +394,61 @@ does not demonstrate accurate numerical correction, and disagreement with the
 judge is not independently verified reward hacking. The ridge student is a
 small frozen-feature baseline, not a fine-tuned reward language model.
 
+## Experiment 2: GSM8K policy improvement
+
+This implements the follow-up described in `README_GSM8K.md`: Base, Proxy PPO,
+Judge PPO, and static kNN PPO. It uses Qwen2.5-1.5B-Instruct and
+Qwen3-4B-Instruct-2507 as frozen reference-aware language-model graders.
+These are separate from the Skywork models in the HH-RLHF experiments.
+
+In the activated Runpod environment, install `.[research,test]`, then run the
+GSM8K smoke setup (prepare only once for each prepared directory):
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_smoke.json --download
+python -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_smoke.json
+```
+
+After preflight passes:
+
+```bash
+python -m reward_gap.cli gsm8k-run --config configs/gsm8k_smoke.json --run-name gsm8k-smoke-01
+```
+
+The smoke run checks two PPO updates per arm. It cannot test the reported
+formatting decline around update 75. Next prepare the full-sized development
+cohorts and run the 100-update pilot:
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_pilot.json --download
+python -m reward_gap.cli gsm8k-run --config configs/gsm8k_pilot.json --run-name gsm8k-pilot-01
+```
+
+Inspect `outputs/gsm8k-pilot-01/report.md`, `metrics.csv`, and the monitor plots.
+The pilot disables official-test evaluation. Shared format/completion penalties
+start at 0.5 each; these are development candidates, not established best values.
+Select them using development results, then freeze them in the full configuration
+and pin model/dataset revisions from the pilot's saved artifacts before running:
+
+```bash
+python -m reward_gap.cli gsm8k-run --config configs/gsm8k_full.json --run-name gsm8k-full-01
+```
+
+The full configuration reuses the pilot's fixed partitions, runs seeds 42/43/44
+with fresh calibration and memory per seed, and trains each arm for 400 updates.
+Each update has eight questions with two responses each. Final evaluation uses
+one greedy answer per official test question after all training is finished.
+The primary endpoint is numeric-match rate, alongside strict accuracy, format,
+unresolved answers, truncation, judge/proxy grades, actual high gaps, and PPO KL.
+The new numeric checker is versioned independently from the historical post-hoc
+checker; no historical result is claimed for this code.
+
+Use `gsm8k-status --config ... --run-name ...` to read progress. Repeating the
+same run resumes completed stages and the latest recovery checkpoint. `--until
+training` stops before official-test evaluation. Only three final checkpoints
+per seed remain; monitor answers and metrics are saved without retaining every
+intermediate policy. Configuration changes require a new run name.
+
 ## Prepare HH-RLHF data
 
 From the project root, allow the first dataset download explicitly:
