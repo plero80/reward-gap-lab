@@ -80,6 +80,7 @@ directory in a copied config; do not mix partitions from different settings.
 | Presets | Shared prepared directory | Manifest |
 | --- | --- | --- |
 | `smoke_gpu.json` | `data/prepared/smoke/` | `input_manifest.json` |
+| `followup.json` | `data/prepared/followup/` | `input_manifest.json` |
 | `rq1_ppo_gpu.json` | `data/prepared/rq1-ppo/` | `input_manifest.json` |
 | `rq1_gpu.json` | `data/prepared/rq1/` | `input_manifest.json` |
 | `gsm8k_smoke.json`, `gsm8k_teachers_smoke.json` | `data/prepared/gsm8k-smoke/` | `manifest.json` |
@@ -310,7 +311,9 @@ The expanded comparison uses protocol `gsm8k_matched_teacher_labels_judge4_v2`.
 ## 7. Original HH-RLHF two-round experiment
 
 This is the coordinator that tests memory refresh. It is separate from RQ1
-and the GSM8K experiments. The supplied GPU preset is a small smoke run:
+and the GSM8K experiments.
+
+### Smoke: two updates per round, seed 42
 
 ```bash
 python -m reward_gap.cli prepare --config configs/smoke_gpu.json --download
@@ -330,7 +333,75 @@ python -m reward_gap.cli status --config configs/smoke_gpu.json --run-name smoke
 Read `outputs/smoke-01/summary.json` and the evaluation rows/manifests it links.
 Completed runs retain `seed-42/corrected_round1.pt` and final checkpoints under
 `seed-42/raw/`, `seed-42/static/` and `seed-42/iterative/`.
-There is currently no separate large `configs/followup.json` preset.
+
+### Full: 200 updates per round, seeds 42, 43 and 44
+
+Use `configs/followup.json`. It starts fresh policies and prepares a separate
+larger dataset; it does not continue from smoke-run weights or reuse smoke
+partitions. The raw dataset cache and model cache can be reused.
+
+In your activated GPU environment (inside `tmux` if you will disconnect), run
+each command separately and proceed only after it succeeds:
+
+```bash
+python -m reward_gap.cli prepare --config configs/followup.json --download
+python -m reward_gap.cli preflight --config configs/followup.json
+python -m reward_gap.cli run --config configs/followup.json --run-name followup-full-01
+```
+
+Skip preparation only if `data/prepared/followup/` already contains the matching
+completed preparation. Full preparation also saves a 400-update training
+schedule for each of the three seeds.
+
+| Setting | Full preset |
+| --- | --- |
+| Training seeds | 42, 43, 44 |
+| Round 1 | 200 updates |
+| Round 2 | 200 additional updates; each final policy has 400 total |
+| Prompts per PPO update | 8 |
+| Calibration prompts | At least 128 |
+| Initial-memory prompts | At least 512 |
+| Training prompt pool | At least 4,096 |
+| Refresh prompts | At least 512 |
+| Reserved validation prompts | At least 256 |
+| Final-evaluation prompts | At least 512 |
+| Recovery checkpoint interval | Every 10 updates; the rolling file is replaced |
+
+Models, learning rate, KL coefficient and memory retrieval settings match the
+smoke preset. Prompt/scoring limits are larger to accommodate longer HH-RLHF
+conversations; overlength inputs still raise an error rather than being silently
+truncated. These are starting workshop settings, not a demonstrated optimal
+budget or a guarantee of a detectable effect. Run preflight and verify GPU
+training before leaving the full experiment unattended.
+
+Within this run, calibration and initial memory M0 are built once using the
+first seed and shared across training seeds. Each seed creates its own M1 from
+its corrected round-1 policy. The validation cohort is reserved; this coordinator
+does not use it for automatic tuning or early stopping.
+
+The three final conditions are:
+
+- **Raw:** proxy rewards for all 400 updates.
+- **Static:** M0 corrections for all 400 updates.
+- **Iterative:** M0 corrections for the first 200 updates, then M1 corrections
+  for the remaining 200.
+
+Static and iterative share the same corrected round-1 checkpoint before they
+split. All final evaluations wait until all seeds and branches finish training.
+
+```bash
+python -m reward_gap.cli status --config configs/followup.json --run-name followup-full-01
+```
+
+Read `outputs/followup-full-01/summary.json` for per-seed, per-branch metrics
+and links to evaluation artifacts. The coordinator does not generate the GSM8K
+plots or an automatic `report.md`. Completed runs retain four checkpoints per
+seed (12 total): the shared corrected round-1 checkpoint and three final branch
+checkpoints. They do not retain every intermediate policy.
+
+Repeat the same run command to resume. Optionally launch with `--until round1`
+to pause after the first round, or `--until training` to pause before final
+evaluation; repeat without that option to continue.
 
 ## 8. Resume, pause and find your results
 

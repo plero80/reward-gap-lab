@@ -328,6 +328,21 @@ Read progress with `python -m reward_gap.cli status --config configs/smoke_gpu.j
 `reward-gap` is also available in place of `python -m reward_gap.cli`.
 The CLI also exposes `prepare --config ... --download`.
 
+For the larger two-round experiment, use `configs/followup.json`: three training
+seeds (42/43/44), 200 updates per round, eight prompts per update, and separate
+prepared cohorts under `data/prepared/followup/`. Prepare these inputs once,
+then preflight and run with a fresh name:
+
+```bash
+python -m reward_gap.cli prepare --config configs/followup.json --download
+python -m reward_gap.cli preflight --config configs/followup.json
+python -m reward_gap.cli run --config configs/followup.json --run-name followup-full-01
+```
+
+These are workshop starting settings; actual GPU training remains to be checked.
+See [the full-run instructions](RUN_EXPERIMENTS.md#full-200-updates-per-round-seeds-42-43-and-44)
+for cohort sizes, shared calibration/M0, status and checkpoint retention.
+
 ## RQ1: Can memory predict disagreement?
 
 The `rq1` command implements section 3 of the workshop plan. It compares kNN,
