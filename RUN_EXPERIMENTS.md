@@ -32,35 +32,44 @@ cd /workspace/reward-gap-lab
 python --version
 ```
 
-Use Python 3.12 or newer. Create and check the project's isolated environment:
+Use Python 3.12 or newer. Check the pod's GPU stack and set up project libraries:
 
 ```bash
 python scripts/setup_runpod.py
 ```
 
-Continue only after `Setup passed`. Activate it and install the research extra
-for plots and reports:
+Continue only after `Setup passed`. The script includes research/plotting and
+test dependencies. Activate the environment:
 
 ```bash
-source .venv-runpod/bin/activate
-python -m pip install -e ".[research,test]"
-python -m pip check
-python -m pip freeze > outputs/setup/environment-research.txt
+source /tmp/reward-gap-lab-venv/bin/activate
 ```
 
-The setup script installs the pinned training dependencies and checks CUDA.
-The research extra adds plotting. Neither step downloads experiment datasets
-or pretrained model weights. Do not copy your Windows `.venv` to Linux.
+Setup reuses the existing PyTorch/CUDA and places additional libraries on local
+disk, avoiding large package extraction on `/workspace` network storage. It
+checks the GPU before dependency resolution, constrains installed GPU versions,
+and refuses an installation plan containing GPU packages. If the existing stack
+is incompatible, it stops rather than replacing it. The actual installation
+uses the checked non-GPU wheels with dependency installation disabled.
+No experiment datasets or model weights are downloaded during setup.
+Do not copy your Windows `.venv` to Linux.
 
 In **each new terminal**, run these two lines again:
 
 ```bash
 cd /workspace/reward-gap-lab
-source .venv-runpod/bin/activate
+source /tmp/reward-gap-lab-venv/bin/activate
 ```
 
 Use persistent storage for the checkout, `data/`, `model_cache/` and `outputs/`.
 Verify that your pod's `/workspace` is backed by the storage you intend to keep.
+The environment under `/tmp` may disappear after a pod restart; rerun setup if
+missing. An older `.venv-runpod` directory is left untouched. If the old installer
+is still running, stop it with Ctrl+C in its original terminal before using the
+updated script. Do not rerun the old script or activate that incomplete environment.
+If setup fails while resolving dependencies, share that error before changing
+GPU libraries. The package now accepts PyTorch >=2.8,<3; only 2.14 has been used
+for local CPU tests, so the pod's inherited version must pass the runtime checks.
 
 ## 3. Understand prepare, preflight and run
 
@@ -447,7 +456,7 @@ caches and run outputs in artifact storage outside Git.
 
 | Symptom | Next step |
 | --- | --- |
-| `No module named reward_gap` or a missing dependency | Activate `.venv-runpod`, then rerun the research-extra installation in section 2. |
+| `No module named reward_gap` or a missing dependency | Rerun the updated setup script, then activate `/tmp/reward-gap-lab-venv` as in section 2. |
 | Config path cannot be found | Run `cd /workspace/reward-gap-lab` before the command. |
 | Prepared directory already exists | Reuse it if settings match. Preflight checks it; do not run preparation over it. |
 | Prepared inputs differ from config | Select a new prepared directory for the changed settings and prepare it. |

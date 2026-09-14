@@ -55,15 +55,17 @@ storage. Use Python 3.12 or newer. In the pod terminal, run:
 ```bash
 cd /workspace/reward-gap-lab
 python scripts/setup_runpod.py
-source .venv-runpod/bin/activate
+source /tmp/reward-gap-lab-venv/bin/activate
 ```
 
-Continue only if setup reports success. This creates a separate Linux environment
-and installs `.[training,test]` from `pyproject.toml`. The separate environment is
-needed because the template's PyTorch, torchvision, and torchaudio versions may
-conflict with our pinned PyTorch version. It does not inherit or uninstall the
-template's libraries. It will download its own PyTorch build and dependencies;
-allow disk space for them. Do not copy the Windows `.venv` to the pod.
+Continue only if setup reports success. It checks the existing PyTorch/CUDA first,
+then creates a Linux environment on local disk that inherits the pod's packages.
+It installs the project, research and test libraries while preserving the existing
+GPU stack. It pins the installed GPU package versions during dependency resolution
+and rejects plans that would install torch, torchvision, torchaudio, Triton or
+CUDA/NVIDIA packages. Actual wheel installation uses `--no-deps` after checking
+the plan. Missing/broken GPU dependencies cause a failure, not an automatic repair.
+Do not copy the Windows `.venv` to the pod.
 
 Setup checks dependency compatibility, project imports, and a CUDA calculation,
 and saves the installed package list to `outputs/setup/environment.txt`. A CUDA
@@ -83,8 +85,10 @@ Only after preflight passes:
 python -m reward_gap.cli run --config configs/smoke_gpu.json --run-name workshop-01
 ```
 
-Activate `.venv-runpod` again in each new terminal. Repeating the setup script
-reuses this environment. No model weights or datasets are downloaded by setup;
+Activate `/tmp/reward-gap-lab-venv` again in each new terminal. Repeating setup
+reuses it when present. Local temporary storage may be lost when the pod restarts;
+rerun setup if missing. The old checkout's `.venv-runpod` is not reused or deleted.
+No model weights or datasets are downloaded by setup;
 preparation and preflight perform those downloads according to their settings.
 
 ### Model-loading dependencies and tests
@@ -96,11 +100,12 @@ To install the tested model/training libraries and run all tests:
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-For GPU experiments, install a CUDA-compatible PyTorch build for the target
-machine. The local loader checks were run with CPU PyTorch 2.14.0 and
+For Runpod, use the setup script above to preserve the existing GPU build.
+The package accepts PyTorch >=2.8,<3; the local loader checks were run with CPU PyTorch 2.14.0 and
 Transformers 5.17.0. PEFT 0.20.0 supplies the LoRA adapter.
 The optional `models` dependency group records those tested
-versions; model tests skip when the optional libraries are absent.
+versions for Transformers/PEFT; model tests skip when optional libraries are absent.
+GPU execution with the pod's inherited PyTorch still needs setup/preflight and a smoke run.
 The `training` extra adds pinned TRL 0.29.1, Accelerate, Datasets and NumPy.
 TRL's PPO API is experimental, so upgrades require rerunning integration tests.
 
@@ -124,7 +129,7 @@ The CPU configuration keeps downloads disabled. The GPU configuration uses
 Both select the same prepared smoke cohorts. This is a loading configuration,
 not an implemented training command.
 
-On the GPU machine, after installing a compatible CUDA PyTorch build:
+On the GPU machine, after the setup checks pass:
 
 ```python
 from reward_gap.config import load_config
@@ -356,7 +361,8 @@ ridge regularization and F1 detector cutoffs before any final labels.
 In the activated Runpod environment, install the plotting extra:
 
 ```bash
-python -m pip install -e ".[research,test]"
+python scripts/setup_runpod.py
+source /tmp/reward-gap-lab-venv/bin/activate
 ```
 
 For a quick check using the already-prepared smoke cohorts (four PPO updates
@@ -437,7 +443,7 @@ Judge PPO, and static kNN PPO. It uses Qwen2.5-1.5B-Instruct and
 Qwen3-4B-Instruct-2507 as frozen reference-aware language-model graders.
 These are separate from the Skywork models in the HH-RLHF experiments.
 
-In the activated Runpod environment, install `.[research,test]`, then run the
+After the Runpod setup script succeeds (it includes `.[research,test]`), run the
 GSM8K smoke setup (prepare only once for each prepared directory):
 
 ```bash
