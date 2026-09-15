@@ -37,8 +37,8 @@ class ExperimentResult:
     state: str
 
 
-def _read(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
+def _read(path: str | Path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 class FollowupExperiment:
@@ -49,6 +49,8 @@ class FollowupExperiment:
     Failed labeling stages retry in a new attempt directory. Training resumes
     its one rolling checkpoint, retaining only final and corrected-round1 states.
     """
+
+    retain_analysis_checkpoints = False
 
     def __init__(self, config: ExperimentConfig, run_dir: str | Path, *,
                  actor_factory: Callable[[int], PPOActor] | None = None,
@@ -123,13 +125,16 @@ class FollowupExperiment:
             self.status = _read(status_path)
             if self.status.get("schema_version") != 1:
                 raise ExperimentError("Unsupported experiment status schema")
+            if self.status.get("response_contract") != "primary-eos-contiguous-nonpad-v1":
+                raise ExperimentError("Historical response contract differs; use a new run or hh-evaluate for retained HH checkpoints")
         else:
             # A lock file is harmless; other files indicate an interrupted initial setup.
             if any(p.name != ".run.lock" for p in self.run_dir.iterdir()):
                 raise ExperimentError("Run directory has files but no experiment status; choose a new directory")
             atomic_write_json(self.run_dir / "resolved_config.json", self.config.to_dict())
             atomic_write_json(self.run_dir / "inputs.json", inputs)
-            self.status = {"schema_version": 1, "state": "ready", "stages": {}, "models": {}}
+            self.status = {"schema_version": 1, "state": "ready", "stages": {}, "models": {},
+                           "response_contract": "primary-eos-contiguous-nonpad-v1"}
             self._status()
 
     def _status(self) -> None:
@@ -270,6 +275,10 @@ class FollowupExperiment:
             while trainer.update_count < stop:
                 history.extend(asdict(m) for m in trainer.train(batches, seeds, until_update=trainer.update_count + 1))
                 atomic_write_json(metrics_path, history)
+                if self.retain_analysis_checkpoints and trainer.update_count == 1 and branch in ("raw", "static"):
+                    first = latest.parent / "update-1.pt"
+                    if not first.exists():
+                        trainer.save_checkpoint(first)
                 if trainer.update_count < stop and trainer.update_count % self.config.training.checkpoint_every == 0:
                     trainer.save_checkpoint(latest, replace_existing=True)
             trainer.save_checkpoint(checkpoint)
@@ -285,7 +294,8 @@ class FollowupExperiment:
         static_done = self.status["stages"].get(f"{prefix}/corrected-round1", {}).get("state") == "completed"
         initial = self.run_dir / prefix / "initial.pt"
         if raw_done and static_done:
-            initial.unlink(missing_ok=True)
+            if not self.retain_analysis_checkpoints:
+                initial.unlink(missing_ok=True)
             return
         actor = self._actor(seed)
         if not initial.exists():
@@ -301,7 +311,8 @@ class FollowupExperiment:
             self._stage(f"{prefix}/{name}", lambda folder, b=branch, r=reward, identity=rid, path=checkpoint:
                         self._train(folder, actor, r, seed, identity, initial, raw_id, path,
                                     self.config.training.round1_updates, b))
-        initial.unlink(missing_ok=True)
+        if not self.retain_analysis_checkpoints:
+            initial.unlink(missing_ok=True)
 
     def _refresh(self, folder: Path, actor, proxy, calibration, memory, seed, checkpoint, reward_id) -> dict:
         trainer = self._trainer(actor, KNNReward(proxy, calibration, memory), seed, reward_id)
@@ -332,7 +343,7 @@ class FollowupExperiment:
             final = self.run_dir / prefix / branch / "final.pt"
             self._stage(f"{prefix}/{branch}-final", lambda folder, b=branch, r=reward, identity=rid, src=source, src_id=source_id, dest=final:
                         self._train(folder, actor, r, seed, identity, src, src_id, dest, self.config.training.total_updates, b))
-            if branch == "raw":
+            if branch == "raw" and not self.retain_analysis_checkpoints:
                 source.unlink(missing_ok=True)  # Raw final replaces its round-one recovery state.
 
     def _evaluate(self, folder, actor, proxy, calibration, memory, seed, branch, reward, reward_id):

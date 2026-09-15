@@ -314,3 +314,48 @@ def test_reward_bridge_preserves_prompts_and_decodes_eos_padding(loaded):
     _, scores, _ = get_reward(RewardModel(bridge), sequences, pad, batch.input_ids.shape[1])
     assert calls == [(tuple(records), ("", "aa"))]
     torch.testing.assert_close(scores, torch.tensor([1., 1.2]))
+
+
+@pytest.mark.parametrize("corrected", [False, True])
+def test_hh_reward_rejects_interior_pad_through_trl(loaded, corrected):
+    from reward_gap._trl_bridge import RewardBridge, RewardModel
+    from reward_gap.rewards import ProxyReward, KNNReward
+    from trl.experimental.utils import get_reward
+    from unittest.mock import Mock
+    actor = actor_for(loaded)
+    records = prompts()
+    batch = format_policy_batch(actor.tokenizer, records, max_prompt_tokens=64,
+                                max_new_tokens=4, context_window=128)
+    from reward_gap.calibration import FrozenCalibration, ScoreScale
+    from reward_gap.memory import GapMemory, MemoryContext
+    scale = ScoreScale("proxy", "v1", 0., 1.)
+    calibration = FrozenCalibration("cal", scale, scale)
+    memory = GapMemory(["a"], torch.ones(1, 2), [0.],
+                       context=MemoryContext("proxy", "v1", "pool", "cal"), k=1)
+    proxy = Mock(role="proxy")
+    strategy = KNNReward(proxy, calibration, memory) if corrected else ProxyReward(proxy, calibration)
+    strategy.score = Mock(side_effect=AssertionError("Misaligned text must not be scored"))
+    bridge = RewardBridge(actor.tokenizer, strategy)
+    bridge.bind(records, batch)
+    token = actor.tokenizer.encode("a", add_special_tokens=False)[0]
+    eos, pad = actor.tokenizer.eos_token_id, actor.tokenizer.pad_token_id
+    suffix = torch.tensor([[token, pad, token, eos], [token, token, token, eos]])
+    with pytest.raises(ValueError, match="PAD"):
+        get_reward(RewardModel(bridge), torch.cat((batch.input_ids, suffix), 1), pad, batch.input_ids.shape[1])
+    strategy.score.assert_not_called()
+
+
+def test_historical_eos_metadata_only_allowed_for_explicit_inference(loaded, tmp_path):
+    run = trainer(loaded)
+    path = run.save_checkpoint(tmp_path / "historical.pt")
+    payload = torch.load(path, weights_only=True)
+    payload["identity"]["tokenizer"]["eos"] = (run.actor.tokenizer.eos_token_id, run.actor.tokenizer.pad_token_id)
+    payload["identity"].pop("response_contract")
+    torch.save(payload, path)
+    with pytest.raises(PPOError, match="identity differs"):
+        run.load_checkpoint(path)
+    with pytest.raises(PPOError, match="tokenizer or adapter differs"):
+        load_policy_checkpoint(run.actor, path)
+    identity = load_policy_checkpoint(run.actor, path, legacy_stop_rule=True)
+    assert identity["identity"]["tokenizer"]["eos"] == payload["identity"]["tokenizer"]["eos"]
+    assert run.actor.eos_ids == (run.actor.tokenizer.eos_token_id,)

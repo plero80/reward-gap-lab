@@ -85,7 +85,9 @@ def preflight(config: ExperimentConfig, *, actor_factory=None, scorer_factory=No
         actor = actor_factory(config.seeds[0]) if actor_factory else PPOActor.load(config, seed=config.seeds[0])
         if actor.tokenizer.pad_token_id == actor.tokenizer.eos_token_id:
             raise PreflightError("TRL PPO requires distinct padding and EOS token IDs")
-        passed(stage, {"source": actor.source, "revision": actor.revision})
+        passed(stage, {"source": actor.source, "revision": actor.revision,
+                       "effective_eos_ids": list(actor.eos_ids),
+                       "response_contract": "primary-eos-contiguous-nonpad-v1"})
 
         stage = "prompt_formatting"
         # Check every prepared prompt, including template overhead and the full

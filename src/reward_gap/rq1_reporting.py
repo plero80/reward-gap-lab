@@ -32,6 +32,9 @@ def write_report(folder, summary):
                   "AP should be interpreted alongside positive prevalence. An all-equal predictor has",
                   "AUROC 0.5 when both classes exist. No positive validation labels yields an",
                   "explicit never-positive detector. Precision is reported as 0 for no detections.", ""])
+    lines.extend(["A constant baseline whose cutoff equals its score flags every answer: recall 1",
+                  "then means no positives were missed, while precision equals positive prevalence.",
+                  "This is not useful discrimination; the constant baseline's AUROC is 0.5.", ""])
     if not summary["distribution_shift_evaluated"]:
         lines.append("Only the initial policy was evaluated. PPO distribution shift has not been tested.")
     training = summary.get("ppo_training", {})

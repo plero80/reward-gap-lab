@@ -150,6 +150,7 @@ def _manifest(actor: Actor, calibration: FrozenCalibration, *, policy_id: str, p
     count = len(rows)
     return {"schema_version": 1, "policy_id": policy_id, "policy_source": actor.source,
             "policy_revision": actor.revision, "generation": asdict(actor.generation),
+            "effective_eos_ids": list(getattr(actor, "eos_ids", ())),
             "calibration": asdict(calibration), "prepared_dir": str(prepared_dir), "cohort": cohort,
             "seed": seed, "batch_size": batch_size, "count": count,
             "metrics": {name: sum(row[field] for row in rows) / count for name, field in (

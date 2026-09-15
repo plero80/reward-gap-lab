@@ -31,9 +31,9 @@ def gap_metrics(actual, predicted, *, theta):
                 "positive_prevalence": None, "positives": 0, "predicted_positives": 0,
                 "detector_cutoff": theta, "mse": None, "pearson": None, "spearman": None,
                 "true_positive": 0, "false_positive": 0, "true_negative": 0, "false_negative": 0}
-    result = base_metrics(actual, predicted, theta=theta, cutoff=theta)
+    result = base_metrics(actual, predicted, theta=theta, cutoff=theta, comparison=">")
     actual, predicted = np.asarray(actual, dtype=float), np.asarray(predicted, dtype=float)
-    positive, detected = actual > theta, predicted >= theta
+    positive, detected = actual > theta, predicted > theta
     result.update(mse=float(np.mean((actual - predicted) ** 2)),
                   pearson=_correlation(actual, predicted),
                   spearman=_correlation(_ranks(actual), _ranks(predicted)),

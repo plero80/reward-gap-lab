@@ -96,13 +96,12 @@ class PPOActor(torch.nn.Module):
             raise PolicyError("Policy must declare a positive context window")
         if loaded.tokenizer.pad_token_id is None or loaded.model.config.pad_token_id != loaded.tokenizer.pad_token_id:
             raise PolicyError("Policy and tokenizer must share a padding token")
-        eos = loaded.model.generation_config.eos_token_id
-        if eos is None:
-            eos = loaded.tokenizer.eos_token_id
-        eos_ids = [eos] if isinstance(eos, int) else eos
-        if not isinstance(eos_ids, (list, tuple)) or not eos_ids or any(type(token) is not int or token < 0 for token in eos_ids):
-            raise PolicyError("Policy needs valid EOS token IDs")
-        self.eos_ids: tuple[int, ...] = tuple(int(token) for token in eos_ids)
+        # TRL truncates at the tokenizer's primary EOS. Use the identical rule
+        # in calibration, memory construction, preflight and evaluation.
+        eos = loaded.tokenizer.eos_token_id
+        if type(eos) is not int or eos < 0 or eos == loaded.tokenizer.pad_token_id:
+            raise PolicyError("Policy needs a primary EOS distinct from PAD")
+        self.eos_ids: tuple[int, ...] = (eos,)
         loaded.model.requires_grad_(False)
         with _seeded(seed, loaded.model.device):
             self.model = get_peft_model(loaded.model, LoraConfig(
@@ -166,6 +165,9 @@ class PPOActor(torch.nn.Module):
             eos |= suffix.eq(token)
         # Include the first EOS action; exclude everything generated after it.
         valid = (eos.long().cumsum(dim=1) - eos.long()).eq(0)
+        if (suffix.eq(self.tokenizer.pad_token_id) & valid).any():
+            from reward_gap.failures import SampleError
+            raise SampleError("Unexpected PAD inside a completion before primary EOS")
         lengths = tuple(int(n) for n in valid.sum(dim=1).tolist())
         reasons: tuple[Literal["eos", "length"], ...] = tuple("eos" if ended else "length" for ended in eos.any(dim=1).tolist())
         attention = torch.cat((batch.attention_mask, valid.long()), dim=1)

@@ -200,3 +200,11 @@ def test_prepared_data_rejects_changed_revision_counts_and_cross_cohort_ids(tmp_
     atomic_write_json(path, rows)
     with pytest.raises(ValueError, match="cohort"):
         load_prepared(config)
+
+
+def test_perfect_gap_predictions_at_threshold_have_no_false_positives():
+    result = gap_metrics([0., 1., 1., 2.], [0., 1., 1., 2.], theta=1.)
+    assert result["mae"] == 0 and result["auroc"] == 1
+    assert result["true_positive"] == 1 and result["true_negative"] == 3
+    assert result["false_positive"] == result["false_negative"] == 0
+    assert result["precision"] == result["recall"] == 1

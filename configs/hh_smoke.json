@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "experiment": "smoke",
+  "seeds": [
+    42
+  ],
+  "models": {
+    "policy": {
+      "id": "Qwen/Qwen2.5-0.5B-Instruct",
+      "revision": "main"
+    },
+    "proxy": {
+      "id": "Skywork/Skywork-Reward-V2-Qwen3-0.6B",
+      "revision": "main"
+    },
+    "judge": {
+      "id": "Skywork/Skywork-Reward-V2-Qwen3-4B",
+      "revision": "main"
+    }
+  },
+  "data": {
+    "revision": "main",
+    "subsets": [
+      "helpful-base",
+      "helpful-online",
+      "helpful-rejection-sampled",
+      "harmless-base"
+    ],
+    "split_seed": 42,
+    "cache_dir": "data/raw/hh-rlhf",
+    "prepared_dir": "data/prepared/hh-unified-smoke",
+    "minimum_prompts": {
+      "calibration": 16,
+      "initial_memory": 32,
+      "training": 32,
+      "refresh": 16,
+      "validation": 8,
+      "final_evaluation": 16
+    }
+  },
+  "training": {
+    "round1_updates": 2,
+    "total_updates": 4,
+    "rollout_batch_size": 2,
+    "learning_rate": 3e-06,
+    "kl_coefficient": 0.05,
+    "checkpoint_every": 2,
+    "ppo_epochs": 4,
+    "minibatch_size": 1,
+    "clip_range": 0.2,
+    "value_clip_range": 0.2,
+    "value_coefficient": 0.5,
+    "gamma": 1.0,
+    "gae_lambda": 0.95,
+    "max_grad_norm": 1.0,
+    "normalize_advantages": true
+  },
+  "policy": {
+    "lora_rank": 8,
+    "lora_alpha": 16,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj",
+      "o_proj",
+      "gate_proj",
+      "up_proj",
+      "down_proj"
+    ]
+  },
+  "generation": {
+    "max_prompt_tokens": 2048,
+    "max_new_tokens": 256,
+    "do_sample": true
+  },
+  "scoring": {
+    "max_tokens": 4096,
+    "batch_size": 4
+  },
+  "memory": {
+    "k": 8,
+    "temperature": 0.1
+  },
+  "runtime": {
+    "device": "cuda:0",
+    "output_root": "outputs",
+    "allow_downloads": true,
+    "dtype": "bfloat16",
+    "model_cache": "model_cache"
+  }
+}

@@ -41,19 +41,19 @@ class RewardBridge(torch.nn.Module):
             suffix = row[self.width:][mask[self.width:].bool()]
             lengths.append(len(suffix))
             reasons.append("eos" if any(suffix.eq(eos).any().item() for eos in self.eos_ids) else "length")
-            if score_rollouts is not None:
-                # Native TRL treats the first PAD as the end of the response.
-                # A sampled PAD inside a completion cannot silently become a
-                # different candidate/length-penalty decision in our adapter.
-                response_mask = mask[self.width:].bool()
-                expected_mask = torch.arange(len(response_mask), device=mask.device) < len(suffix)
-                if (not torch.equal(response_mask, expected_mask) or not len(suffix)
-                        or (reasons[-1] == "length" and len(suffix) != len(response_mask))):
-                    error = "Unexpected PAD inside a completion; cannot establish its EOS/length status"
-                    if getattr(self.strategy, "recover_sample_failures", False):
-                        self.sample_failure = SampleError(error)
-                        raise self.sample_failure
-                    raise ValueError(error)
+            # Native TRL treats the first PAD as the end of the response.
+            # A sampled PAD inside a completion cannot silently become a
+            # different candidate/length-penalty decision in our adapter.
+            response_mask = mask[self.width:].bool()
+            expected_mask = torch.arange(len(response_mask), device=mask.device) < len(suffix)
+            if (not torch.equal(response_mask, expected_mask) or not len(suffix)
+                    or (reasons[-1] == "length" and len(suffix) != len(response_mask))
+                    or any(suffix[:-1].eq(eos).any().item() for eos in self.eos_ids)):
+                error = "Unexpected PAD inside a completion; cannot establish its EOS/length status"
+                if getattr(self.strategy, "recover_sample_failures", False):
+                    self.sample_failure = SampleError(error)
+                    raise self.sample_failure
+                raise ValueError(error)
             answers.append(self.tokenizer.decode(suffix.tolist(), skip_special_tokens=True,
                                                  clean_up_tokenization_spaces=False))
         try:

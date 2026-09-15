@@ -71,7 +71,7 @@ def select_cutoff(actual, predicted, theta):
     return float(cutoffs[np.argmax(f1)])
 
 
-def metrics(actual, predicted, *, theta, cutoff):
+def metrics(actual, predicted, *, theta, cutoff, comparison=">="):
     g, p = _array(actual), _array(predicted)
     if g.shape != p.shape or not np.isfinite(theta):
         raise ValueError("Metrics require aligned gaps and a finite threshold")
@@ -79,7 +79,10 @@ def metrics(actual, predicted, *, theta, cutoff):
     y = g > theta
     positives = int(y.sum())
     negative_count = len(y) - positives
-    selected = np.zeros(len(y), dtype=bool) if cutoff is None else p >= cutoff
+    if comparison not in (">", ">="):
+        raise ValueError("Detector comparison must be > or >=")
+    selected = (np.zeros(len(y), dtype=bool) if cutoff is None else
+                (p > cutoff if comparison == ">" else p >= cutoff))
     tp = int((selected & y).sum())
     _, rank_tp, rank_fp = _ranking(y, p)
     auc = ap = None

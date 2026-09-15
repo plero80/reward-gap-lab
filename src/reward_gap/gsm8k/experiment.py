@@ -73,6 +73,8 @@ class GSMExperiment(FollowupExperiment):
                     "grade_parser": GRADE_PARSER_VERSION,
                     "failure_policy": FAILURE_POLICY,
                     "policy_stop_rule": "tokenizer_primary_eos",
+                    "response_contract": "primary-eos-contiguous-nonpad-v1",
+                    "gap_detector_rule": "actual-and-predicted-strict-greater-than-theta-v2",
                     "config": self.gsm_config.to_dict(), "manifest": self.manifest,
                     "cohorts": {name: [asdict(q) for q in rows] for name, rows in self.cohorts.items()}}
         path = self.run_dir / "resolved_protocol.json"

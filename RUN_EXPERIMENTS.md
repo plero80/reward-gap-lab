@@ -1,5 +1,11 @@
 # How to run the experiments
 
+**For new HH-RLHF work, use the [combined HH experiment](docs/hh_unified.md).**
+It runs the proxy/static/refreshed policy comparison and RQ1 predictor analysis
+together with shared artifacts and one readable report. Use `hh_seed42.json`
+for one full seed or `hh_smoke.json` for the execution check. Older RQ1 and
+two-round commands below remain documented for historical results.
+
 This guide uses the current repository commands and presets. Run the commands
 in a **Linux GPU terminal**, such as your Runpod terminal, from the project root.
 Run one command at a time and wait for it to succeed before continuing.

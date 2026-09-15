@@ -51,7 +51,7 @@ def _policy_identity(actor: PPOActor) -> dict:
                           "size": len(actor.tokenizer)}}
 
 
-def load_policy_checkpoint(actor: PPOActor, path: str | Path) -> dict:
+def load_policy_checkpoint(actor: PPOActor, path: str | Path, *, legacy_stop_rule: bool = False) -> dict:
     """Load only policy/value weights for held-out inference, without optimizer/RNG.
 
     Generation limits and device may differ from training; model, tokenizer,
@@ -64,7 +64,15 @@ def load_policy_checkpoint(actor: PPOActor, path: str | Path) -> dict:
     if (not isinstance(identity, dict) or type(payload.get("update")) is not int or payload["update"] < 0
             or type(payload.get("trainer_seed")) is not int):
         raise PPOError("Invalid inference checkpoint metadata")
-    if any(identity.get(key) != value for key, value in _policy_identity(actor).items()):
+    expected = _policy_identity(actor)
+    if legacy_stop_rule:
+        # Historical HH inference only: load weights while explicitly recording
+        # that new answers use primary EOS. Never relax optimizer resume checks.
+        old = identity.get("tokenizer", {})
+        if actor.tokenizer.eos_token_id not in old.get("eos", ()):
+            raise PPOError("Historical checkpoint has no matching primary EOS")
+        expected["tokenizer"]["eos"] = old["eos"]
+    if any(identity.get(key) != value for key, value in expected.items()):
         raise PPOError("Inference checkpoint model, tokenizer or adapter differs")
     parameters = {name: parameter for name, parameter in actor.named_parameters() if parameter.requires_grad}
     saved = payload.get("parameters")
@@ -297,6 +305,7 @@ class PPOTrainer:
 
     def _identity(self) -> dict:
         return {"experiment_id": self.experiment_id, "reward_id": self.reward_id,
+                "response_contract": "primary-eos-contiguous-nonpad-v1",
                 **({"sampling_temperature": self.temperature} if self.temperature != 1.0 else {}),
                 "training": asdict(self.config), "generation": asdict(self.actor.generation),
                 "device": str(self.actor.device), **_policy_identity(self.actor),

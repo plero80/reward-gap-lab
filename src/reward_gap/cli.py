@@ -13,6 +13,8 @@ def main(argv: list[str] | None = None) -> None:
                             ("preflight", "Check inputs, device and model inference"),
                             ("run", "Run or resume the two-round experiment"),
                             ("rq1", "Evaluate frozen gap predictors before and after PPO"),
+                            ("hh-run", "Run or resume the combined HH-RLHF experiment"),
+                            ("hh-evaluate", "Analyze retained HH checkpoints without PPO training"),
                             ("gsm8k-prepare", "Prepare question-disjoint GSM8K cohorts"),
                             ("gsm8k-preflight", "Check GSM8K policy and generative graders"),
                             ("gsm8k-run", "Run or resume the three-arm GSM8K comparison"),
@@ -22,11 +24,13 @@ def main(argv: list[str] | None = None) -> None:
         command.add_argument("--config", required=True, help="Experiment JSON path")
         if name in ("prepare", "gsm8k-prepare"):
             command.add_argument("--download", action="store_true", help="Allow dataset downloads")
-        if name in ("run", "status", "rq1", "gsm8k-run", "gsm8k-status"):
+        if name in ("run", "status", "rq1", "gsm8k-run", "gsm8k-status", "hh-run", "hh-evaluate"):
             command.add_argument("--run-name", required=True)
         if name == "rq1":
             command.add_argument("--plan", required=True, help="RQ1 prediction/evaluation plan JSON")
-        if name == "run":
+        if name == "hh-evaluate":
+            command.add_argument("--source-run", required=True, help="Original HH run name within output_root")
+        if name in ("run", "hh-run"):
             command.add_argument("--until", choices=("round1", "training", "complete"), default="complete",
                                  help="Pause after a stage boundary; rerun without this option to continue")
         if name == "gsm8k-run":
@@ -80,6 +84,17 @@ def main(argv: list[str] | None = None) -> None:
             from reward_gap.rq1 import RQ1Experiment, load_plan
             result = RQ1Experiment(config, run_dir, plan=load_plan(args.plan)).run()
             print(f"RQ1 {result.state}: {result.summary_path}")
+        elif args.command == "hh-run":
+            from reward_gap.hh import HHExperiment
+            result = HHExperiment(config, run_dir).run(until=args.until)
+            print(f"HH {result.state}: {result.summary_path or result.status_path}")
+        elif args.command == "hh-evaluate":
+            from reward_gap.hh import evaluate_hh
+            source = (root / args.source_run).resolve()
+            if source == root or not source.is_relative_to(root):
+                raise ValueError("Source run must be inside output_root")
+            evaluate_hh(config, source, run_dir)
+            print(f"HH analysis completed: {run_dir / 'report.html'}")
         else:
             from reward_gap.experiment import FollowupExperiment
             result = FollowupExperiment(config, run_dir).run(until=args.until)

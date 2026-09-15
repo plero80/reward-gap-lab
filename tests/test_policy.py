@@ -15,6 +15,14 @@ from reward_gap.models import LoadedModel
 from reward_gap.policy import PPOActor, PolicyError
 
 
+def nonpad_logits(module, inputs, output):
+    # Random tiny models give PAD ordinary probability. Normal integration
+    # fixtures generate valid completions; dedicated scripted cases test PAD.
+    result = output.clone()
+    result[..., 0] = -1e4
+    return result
+
+
 @pytest.fixture
 def loaded():
     special = ["[PAD]", "[BOS]", "[EOS]", "[UNK]", "[USER]", "[ASSISTANT]"]
@@ -35,6 +43,7 @@ def loaded():
     with torch.random.fork_rng():
         torch.manual_seed(5)
         model = Qwen2ForCausalLM(config)
+    model.lm_head.register_forward_hook(nonpad_logits)
     return LoadedModel(model, tokenizer, "tiny-local-qwen2", None, "policy")
 
 
@@ -72,6 +81,9 @@ def test_eos_masks_empty_completion_and_length_stop(loaded, monkeypatch, pad_is_
     if pad_is_eos:
         loaded.tokenizer.pad_token = loaded.tokenizer.eos_token
         loaded.model.config.pad_token_id = loaded.tokenizer.pad_token_id
+        with pytest.raises(PolicyError, match="distinct from PAD"):
+            actor_for(loaded)
+        return
     actor = actor_for(loaded)
     eos, pad = loaded.tokenizer.eos_token_id, loaded.tokenizer.pad_token_id
     token = loaded.tokenizer.encode("a", add_special_tokens=False)[0]
@@ -198,7 +210,7 @@ def test_recomputed_log_probs_match_distribution_used_for_sampling(loaded, monke
         captured.append(result)
         return result.sequences
     monkeypatch.setattr(actor.model, "generate", capture)
-    rollout = actor.generate(prompts(), seed=11)
+    rollout = actor.generate(prompts(), seed=12)
     with torch.no_grad():
         stats = actor.statistics(rollout)
     for step, logits in enumerate(captured[0].scores):
@@ -207,14 +219,25 @@ def test_recomputed_log_probs_match_distribution_used_for_sampling(loaded, monke
         assert torch.allclose(stats.log_probs[active, step], expected[active], atol=1e-6)
 
 
-def test_multiple_eos_ids_are_recognized(loaded, monkeypatch):
+def test_primary_eos_matches_ppo_despite_pretrained_eos_list(loaded, monkeypatch):
     alternative = loaded.tokenizer.encode("!", add_special_tokens=False)[0]
     loaded.model.generation_config.eos_token_id = [loaded.tokenizer.eos_token_id, alternative]
     actor = actor_for(loaded)
-    pad = loaded.tokenizer.pad_token_id
+    eos, pad = loaded.tokenizer.eos_token_id, loaded.tokenizer.pad_token_id
     token = loaded.tokenizer.encode("a", add_special_tokens=False)[0]
-    scripted_generation(actor, monkeypatch, [[alternative, pad, pad, pad], [token, alternative, pad, pad]])
+    scripted_generation(actor, monkeypatch, [[alternative, token, eos, pad], [token, alternative, token, eos]])
     rollout = actor.generate(prompts(), seed=1)
-    assert rollout.response_lengths == (1, 2)
+    assert actor.eos_ids == (eos,)
+    assert rollout.response_lengths == (3, 4)
     assert rollout.finish_reasons == ("eos", "eos")
     assert actor.statistics(rollout).bootstrap_values.eq(0).all()
+
+
+def test_standalone_generation_rejects_pad_before_eos(loaded, monkeypatch):
+    from reward_gap.failures import SampleError
+    actor = actor_for(loaded)
+    pad, eos = actor.tokenizer.pad_token_id, actor.tokenizer.eos_token_id
+    token = actor.tokenizer.encode("a", add_special_tokens=False)[0]
+    scripted_generation(actor, monkeypatch, [[token, pad, token, eos], [token, token, token, eos]])
+    with pytest.raises(SampleError, match="PAD"):
+        actor.generate(prompts(), seed=1)

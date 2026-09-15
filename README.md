@@ -1,5 +1,15 @@
 # Reward Gap Lab
 
+## Combined HH-RLHF experiment
+
+Use [`hh-run`](docs/hh_unified.md) for new HH studies: one calibration/M0,
+two PPO rounds with static and refreshed branches, and paired RQ1-style
+predictor evaluation on identical saved answers. The report separates policy
+scores from detector/prediction metrics and includes matched frozen/updated
+linear baselines. `hh-evaluate` analyzes retained two-round checkpoints without
+PPO retraining. See the guide for smoke, single-seed, resume and compatibility
+instructions. GSM8K keeps its single static-memory training design.
+
 Experiments testing whether a k-nearest-neighbor reward-gap memory
 can improve language-model training with PPO.
 
