@@ -63,6 +63,33 @@ complete GPU-time or judge-call cost comparison across the entire workload.
 
 ## Run one seed on a GPU pod
 
+### H200 NVL
+
+Use **one H200 NVL** with the existing `hh_seed42.json` full preset. It uses
+`cuda:0`, BF16, eight responses per PPO update, minibatches of two, and scoring
+batches of two. The implementation uses one GPU; NVLink does not distribute
+this run across additional GPUs automatically. Throughput and peak memory
+still need measurement on the pod.
+
+Use `hh_h200_smoke.json` for the initial check on this GPU. It copies the full
+run's model, batch and token limits (8,192 prompt tokens, 256 answer tokens,
+16,384 scorer tokens) with small cohorts and two updates per round. It uses
+its own prepared directory because the generic smoke preset's training
+schedule has a different batch size. This checks the full configuration on
+small cohorts, not every possible long prompt in the full dataset.
+
+After setup and activation below, run these commands one at a time:
+
+```bash
+python -m reward_gap.cli prepare --config configs/hh_h200_smoke.json --download
+python -m reward_gap.cli preflight --config configs/hh_h200_smoke.json
+python -u -m reward_gap.cli hh-run --config configs/hh_h200_smoke.json --run-name hh-h200-smoke-01
+```
+
+Then use the full seed-42 commands below. No B200/GSM8K preset is needed for HH.
+
+### Setup and full run
+
 Update the checkout before starting a **new** run. In the pod terminal:
 
 ```bash
