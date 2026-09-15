@@ -15,14 +15,6 @@ from reward_gap.models import LoadedModel
 from reward_gap.policy import PPOActor, PolicyError
 
 
-def nonpad_logits(module, inputs, output):
-    # Random tiny models give PAD ordinary probability. Normal integration
-    # fixtures generate valid completions; dedicated scripted cases test PAD.
-    result = output.clone()
-    result[..., 0] = -1e4
-    return result
-
-
 @pytest.fixture
 def loaded():
     special = ["[PAD]", "[BOS]", "[EOS]", "[UNK]", "[USER]", "[ASSISTANT]"]
@@ -43,13 +35,13 @@ def loaded():
     with torch.random.fork_rng():
         torch.manual_seed(5)
         model = Qwen2ForCausalLM(config)
-    model.lm_head.register_forward_hook(nonpad_logits)
     return LoadedModel(model, tokenizer, "tiny-local-qwen2", None, "policy")
 
 
-def actor_for(loaded, *, do_sample=True):
+def actor_for(loaded, *, do_sample=True, suppress_pad_token=True):
     return PPOActor(loaded, policy=PolicyConfig(lora_rank=2, lora_alpha=4, target_modules=("q_proj", "v_proj")),
-                    generation=GenerationConfig(max_prompt_tokens=64, max_new_tokens=4, do_sample=do_sample), seed=42)
+                    generation=GenerationConfig(max_prompt_tokens=64, max_new_tokens=4, do_sample=do_sample,
+                                                suppress_pad_token=suppress_pad_token), seed=42)
 
 
 def prompts():
@@ -162,6 +154,8 @@ def test_disabled_adapter_matches_original_base_after_adapter_changes(loaded, mo
     inputs, mask = actor._inputs(rollout)
     with torch.no_grad():
         output = base(**inputs, use_cache=False, return_dict=True)
+        # The reference is the original base conditioned on non-PAD actions.
+        output.logits[..., loaded.tokenizer.pad_token_id] = -10000.
         expected = actor._log_probs(output.logits[:, rollout.prompt_width - 1:-1], rollout.response_ids, mask)
         for name, parameter in actor.named_parameters():
             if "lora_B" in name:

@@ -59,6 +59,15 @@ class GenerationConfig:
     max_prompt_tokens: int = 512
     max_new_tokens: int = 256
     do_sample: bool = True
+    suppress_pad_token: bool = False
+
+    def to_dict(self) -> dict:
+        values = asdict(self)
+        # Existing configs/checkpoints did not mask PAD. Preserve their exact
+        # identity; opting in is an explicit change to the policy distribution.
+        if not self.suppress_pad_token:
+            values.pop("suppress_pad_token")
+        return values
 
 
 @dataclass(frozen=True)
@@ -141,6 +150,7 @@ class ExperimentConfig:
     def to_dict(self) -> dict:
         """Return JSON-compatible settings including all resolved defaults."""
         result = asdict(self)
+        result["generation"] = self.generation.to_dict()
         result["seeds"] = list(self.seeds)
         result["runtime"]["output_root"] = str(self.runtime.output_root)
         result["runtime"]["model_cache"] = str(self.runtime.model_cache)
@@ -283,6 +293,8 @@ def load_config(path: str | Path) -> ExperimentConfig:
     _integer(generation.max_new_tokens, "generation.max_new_tokens")
     if type(generation.do_sample) is not bool:
         raise ConfigError("generation.do_sample: expected true or false")
+    if type(generation.suppress_pad_token) is not bool:
+        raise ConfigError("generation.suppress_pad_token: expected true or false")
     scoring = ScoringConfig(**_object(raw.get("scoring", {}), {f.name for f in fields(ScoringConfig)}, "scoring"))
     _integer(scoring.max_tokens, "scoring.max_tokens")
     _integer(scoring.batch_size, "scoring.batch_size")

@@ -7,6 +7,22 @@ experiment; this change adds no GSM8K training stages.
 
 ## What is trained
 
+Current HH presets enable `generation.suppress_pad_token=true`. PAD logits are
+masked at the policy output head, so standalone generation, native TRL rollout
+sampling, optimization likelihoods and adapter-disabled reference likelihoods
+all use the same mask. PAD remains a padding token; only primary EOS ends a
+response. Other valid vocabulary tokens and the tokenizer are unchanged.
+The logit is set to -10,000 (rounded to model dtype), which underflows its
+probability at the experiment's sampling temperature. Using a finite logit
+avoids NaNs in TRL's entropy calculation. Existing alignment checks still reject
+malformed completions supplied by an external generation implementation.
+
+The option and its versioned mask are recorded in checkpoint identity.
+Runs created without the mask require a fresh run name with the updated HH
+presets. Prepared prompts/schedules and model/download caches can be reused;
+old calibration/memory and trained policies belong to the original distribution.
+See [the recovery commands](../RUN_EXPERIMENTS.md#hh-recover-from-unexpected-pad-inside-a-completion-before-primary-eos).
+
 1. Generate initial calibration answers and freeze proxy/judge normalization.
 2. Build initial memory M0 from a separate cohort of initial-policy answers.
 3. Train proxy-only and M0-corrected policies through round 1.

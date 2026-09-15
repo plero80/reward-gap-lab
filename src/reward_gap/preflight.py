@@ -87,6 +87,7 @@ def preflight(config: ExperimentConfig, *, actor_factory=None, scorer_factory=No
             raise PreflightError("TRL PPO requires distinct padding and EOS token IDs")
         passed(stage, {"source": actor.source, "revision": actor.revision,
                        "effective_eos_ids": list(actor.eos_ids),
+                       "suppress_pad_token": actor.generation.suppress_pad_token,
                        "response_contract": "primary-eos-contiguous-nonpad-v1"})
 
         stage = "prompt_formatting"

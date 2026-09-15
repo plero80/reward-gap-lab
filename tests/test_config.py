@@ -63,6 +63,7 @@ def test_defaults_and_paths_do_not_depend_on_working_directory(config_file, monk
     ({"runtime": {"allow_downloads": "false"}}, "allow_downloads"),
     ({"runtime": {"device": "typo"}}, "runtime.device"),
     ({"runtime": {"output_root": ""}}, "output_root"),
+    ({"generation": {"suppress_pad_token": "true"}}, "suppress_pad_token"),
 ])
 def test_reject_invalid_settings(config_file, patch, message):
     raw = json.loads(config_file.read_text(encoding="utf-8"))
@@ -70,6 +71,18 @@ def test_reject_invalid_settings(config_file, patch, message):
     config_file.write_text(json.dumps(raw), encoding="utf-8")
     with pytest.raises(ConfigError, match=message):
         load_config(config_file)
+
+
+def test_pad_suppression_is_explicit_and_roundtrips(config_file):
+    original = load_config(config_file)
+    assert not original.generation.suppress_pad_token
+    assert "suppress_pad_token" not in original.to_dict()["generation"]
+    raw = original.to_dict()
+    raw["generation"]["suppress_pad_token"] = True
+    config_file.write_text(json.dumps(raw), encoding="utf-8")
+    changed = load_config(config_file)
+    assert changed.generation.suppress_pad_token
+    assert changed.to_dict()["generation"]["suppress_pad_token"] is True
 
 
 @pytest.mark.parametrize("contents, message", [

@@ -66,7 +66,8 @@
   "generation": {
     "max_prompt_tokens": 8192,
     "max_new_tokens": 256,
-    "do_sample": true
+    "do_sample": true,
+    "suppress_pad_token": true
   },
   "scoring": {
     "max_tokens": 16384,

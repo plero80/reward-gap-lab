@@ -3,6 +3,7 @@
 from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from typing import Literal
 
 import torch
@@ -18,6 +19,22 @@ from reward_gap.models import LoadedModel, load_experiment_model
 
 class PolicyError(ValueError):
     """Unsupported policy configuration or malformed rollout."""
+
+
+PAD_LOGIT_MASK = "pad-logit-minus-10000-v1"
+
+
+def _mask_pad_logit(module, inputs, logits, *, pad_token_id):
+    """Apply one distribution to decoding, PPO old/new logits and reference KL.
+
+    A finite negative value underflows PAD probability at experiment sampling
+    temperatures while keeping TRL's p * logit entropy calculation
+    finite (negative infinity would produce 0 * -inf / NaN there).
+    This hook stays active when PEFT temporarily disables the reference adapter.
+    """
+    masked = logits.clone()
+    masked[..., pad_token_id] = -10000.
+    return masked
 
 
 @dataclass(frozen=True)
@@ -84,6 +101,8 @@ class PPOActor(torch.nn.Module):
                 raise PolicyError(f"{name} must be a positive integer")
         if type(generation.do_sample) is not bool:
             raise PolicyError("do_sample must be a boolean")
+        if type(generation.suppress_pad_token) is not bool:
+            raise PolicyError("suppress_pad_token must be a boolean")
         if (not policy.target_modules or any(t not in PolicyConfig().target_modules for t in policy.target_modules)
                 or len(set(policy.target_modules)) != len(policy.target_modules)):
             raise PolicyError("Choose unique supported Qwen LoRA target modules")
@@ -113,6 +132,9 @@ class PPOActor(torch.nn.Module):
                                              device=loaded.model.device, dtype=torch.float32)
             torch.nn.init.zeros_(self.value_head.weight)
             torch.nn.init.zeros_(self.value_head.bias)
+        if generation.suppress_pad_token:
+            self.model.get_output_embeddings().register_forward_hook(
+                partial(_mask_pad_logit, pad_token_id=self.tokenizer.pad_token_id))
         self.model.eval()
 
     @property
@@ -128,7 +150,8 @@ class PPOActor(torch.nn.Module):
     def generate(self, prompts: Sequence[PromptRecord], *, seed: int, temperature: float = 1.0) -> RolloutBatch:
         """Generate once; retain original sampled IDs including the first EOS.
 
-        Sampling uses the full softmax at the requested temperature (default 1).
+        Sampling uses softmax at the requested temperature (default 1), with
+        the same optional PAD logit mask as PPO/reference likelihoods.
         No inherited Qwen top-k/top-p/repetition penalties alter it. The
         statistics helpers describe temperature-1 logits; TRL computes its
         own temperature-adjusted training probabilities.

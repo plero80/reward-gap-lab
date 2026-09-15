@@ -19,7 +19,7 @@ from peft import LoraConfig
 
 from reward_gap.config import TrainingConfig
 from reward_gap.data import PromptRecord
-from reward_gap.policy import PPOActor, _seeded
+from reward_gap.policy import PPOActor, PAD_LOGIT_MASK, _seeded
 from reward_gap.formatting import format_policy_batch
 from reward_gap._trl_bridge import RewardBridge, RewardModel, ValueModel
 from reward_gap.rewards import RewardBatch
@@ -42,6 +42,7 @@ def _policy_identity(actor: PPOActor) -> dict:
     if not isinstance(adapter, LoraConfig) or not isinstance(adapter.target_modules, set):
         raise PPOError("Checkpoint requires the actor's named LoRA target modules")
     return {"source": actor.source, "revision": actor.revision,
+            **({"pad_logit_mask": PAD_LOGIT_MASK} if actor.generation.suppress_pad_token else {}),
             "context_window": actor.context_window,
             "base_dtype": str(next(actor.model.parameters()).dtype),
             "adapter": {"rank": adapter.r, "alpha": adapter.lora_alpha,
@@ -72,7 +73,8 @@ def load_policy_checkpoint(actor: PPOActor, path: str | Path, *, legacy_stop_rul
         if actor.tokenizer.eos_token_id not in old.get("eos", ()):
             raise PPOError("Historical checkpoint has no matching primary EOS")
         expected["tokenizer"]["eos"] = old["eos"]
-    if any(identity.get(key) != value for key, value in expected.items()):
+    if (identity.get("pad_logit_mask") != expected.get("pad_logit_mask")
+            or any(identity.get(key) != value for key, value in expected.items())):
         raise PPOError("Inference checkpoint model, tokenizer or adapter differs")
     parameters = {name: parameter for name, parameter in actor.named_parameters() if parameter.requires_grad}
     saved = payload.get("parameters")
@@ -307,7 +309,7 @@ class PPOTrainer:
         return {"experiment_id": self.experiment_id, "reward_id": self.reward_id,
                 "response_contract": "primary-eos-contiguous-nonpad-v1",
                 **({"sampling_temperature": self.temperature} if self.temperature != 1.0 else {}),
-                "training": asdict(self.config), "generation": asdict(self.actor.generation),
+                "training": asdict(self.config), "generation": self.actor.generation.to_dict(),
                 "device": str(self.actor.device), **_policy_identity(self.actor),
                 "packages": {name: version(name) for name in ("torch", "transformers", "peft", "trl", "accelerate", "numpy")}}
 

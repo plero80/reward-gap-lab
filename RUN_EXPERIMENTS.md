@@ -10,6 +10,39 @@ This guide uses the current repository commands and presets. Run the commands
 in a **Linux GPU terminal**, such as your Runpod terminal, from the project root.
 Run one command at a time and wait for it to succeed before continuing.
 
+### HH: recover from `Unexpected PAD inside a completion before primary EOS`
+
+The current HH presets explicitly enable `generation.suppress_pad_token=true`.
+The policy masks PAD logits in standalone generation, PPO sampling, PPO loss
+and reference-policy scoring. This prevents sampling a padding action while
+preserving the existing primary-EOS stopping and response-alignment checks.
+The finite mask also keeps TRL entropy metrics valid. Model/tokenizer vocabulary
+and the prepared dataset are unchanged.
+
+This changes the policy distribution and is recorded in config/checkpoint
+identity. Use a **new run name** for a previously failed HH run; old unmasked
+training checkpoints and calibration/memory artifacts are not mixed into the
+corrected run. Existing raw downloads, model weights and prepared prompt
+cohorts/schedules can be reused. The GSM8K presets keep their existing sampling
+behavior and checkpoint identities.
+
+After syncing this fix to the pod, an already prepared seed-42 dataset can run
+with the following commands (no repeat download or preparation is needed):
+
+```bash
+cd /workspace/reward-gap-lab
+source /tmp/reward-gap-lab-venv/bin/activate
+mkdir -p outputs/logs
+set -o pipefail
+python -m reward_gap.cli preflight --config configs/hh_seed42.json &&
+python -u -m reward_gap.cli hh-run --config configs/hh_seed42.json --run-name hh-seed42-padfix 2>&1 | tee -a outputs/logs/hh-seed42-padfix.log
+```
+
+For an H200 smoke check, use the updated `hh_h200_smoke.json` and a fresh name
+such as `hh-h200-smoke-padfix`. Once a corrected run starts, resume it using its
+same config and name. Preflight's `policy_loading` result records
+`suppress_pad_token: true` when the fix is enabled.
+
 ## 1. Choose the experiment
 
 An **arm** is one training condition. For example, Proxy PPO and Judge-4B PPO
