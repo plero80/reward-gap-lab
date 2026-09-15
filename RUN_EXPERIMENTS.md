@@ -533,6 +533,141 @@ Repeat the same run command to resume. Optionally launch with `--until round1`
 to pause after the first round, or `--until training` to pause before final
 evaluation; repeat without that option to continue.
 
+## B300: standard Experiment 2 (GSM8K)
+
+Use one B300 GPU with `configs/gsm8k_b300_full.json`. This preset uses
+BF16, scoring batches of 16, and recovery checkpoints every 10 updates.
+It keeps the H200 full preset's models, 16 responses per PPO update,
+400 updates per arm, three seeds, cohorts and evaluation settings.
+The smoke preset uses the same model/token/batch settings with two updates
+and checkpoints every update. These are starting settings, not a measured
+B300 performance guarantee; pass setup and the smoke run on your pod first.
+
+On the B300 pod, restore the project and its persistent data/model cache under
+`/workspace/reward-gap-lab`. Run setup using the pod's Python and wait for
+`Setup passed`; this checks and reuses the installed GPU stack:
+
+```bash
+cd /workspace/reward-gap-lab
+python scripts/setup_runpod.py
+```
+
+Start a persistent terminal (`apt-get update && apt-get install -y tmux` if
+tmux is missing), then activate the environment inside it:
+
+```bash
+tmux new -s gsm8k-b300
+cd /workspace/reward-gap-lab
+source /tmp/reward-gap-lab-venv/bin/activate
+set -o pipefail
+mkdir -p outputs/logs
+```
+
+Prepare smoke inputs only if matching `data/prepared/gsm8k-smoke/manifest.json`
+does not already exist:
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_b300_smoke.json --download
+```
+
+Check inference and training:
+
+```bash
+python -u -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_b300_smoke.json &&
+python -u -m reward_gap.cli gsm8k-run --config configs/gsm8k_b300_smoke.json --run-name gsm8k-b300-smoke-01 2>&1 | tee -a outputs/logs/gsm8k-b300-smoke-01.log
+```
+
+After `GSM8K completed`, check the smoke summary's `optimized_batches` and
+skipped batches. Prepare full inputs only if matching
+`data/prepared/gsm8k-followup/manifest.json` does not already exist:
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_b300_full.json --download
+```
+
+Start the full experiment:
+
+```bash
+python -u -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_b300_full.json &&
+python -u -m reward_gap.cli gsm8k-run --config configs/gsm8k_b300_full.json --run-name gsm8k-b300-full-01 2>&1 | tee -a outputs/logs/gsm8k-b300-full-01.log
+```
+
+Detach with **Ctrl+B**, then **D**. Reconnect with `tmux attach -t gsm8k-b300`.
+Keep the pod running; tmux does not survive a pod restart. After a genuine
+interruption, restore/activate the environment and repeat the full command
+with the same config and run name. Up to nine updates after the latest saved
+training checkpoint may repeat. Do not launch a second copy of an active run.
+Use a fresh run name for this preset; resume an older experiment with its
+original config. Results are in `outputs/gsm8k-b300-full-01/`.
+
+## B200: standard Experiment 2 (GSM8K)
+
+Use one B200 GPU with `configs/gsm8k_b200_full.json`. This preset uses
+BF16, scoring batches of 8, and recovery checkpoints every 10 updates.
+Scoring starts conservatively at the H200 batch size; benchmark on the pod
+before increasing it. It keeps the H200 full preset's models, 16 responses per PPO update,
+400 updates per arm, three seeds, cohorts and evaluation settings.
+The smoke preset uses the same model/token/batch settings with two updates
+and checkpoints every update. These are starting settings, not a measured
+B200 performance guarantee; pass setup and the smoke run on your pod first.
+
+On the B200 pod, restore the project and its persistent data/model cache under
+`/workspace/reward-gap-lab`. Run setup using the pod's Python and wait for
+`Setup passed`; this checks and reuses the installed GPU stack:
+
+```bash
+cd /workspace/reward-gap-lab
+python scripts/setup_runpod.py
+```
+
+Start a persistent terminal (`apt-get update && apt-get install -y tmux` if
+tmux is missing), then activate the environment inside it:
+
+```bash
+tmux new -s gsm8k-b200
+cd /workspace/reward-gap-lab
+source /tmp/reward-gap-lab-venv/bin/activate
+set -o pipefail
+mkdir -p outputs/logs
+```
+
+Prepare smoke inputs only if matching `data/prepared/gsm8k-smoke/manifest.json`
+does not already exist:
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_b200_smoke.json --download
+```
+
+Check inference and training:
+
+```bash
+python -u -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_b200_smoke.json &&
+python -u -m reward_gap.cli gsm8k-run --config configs/gsm8k_b200_smoke.json --run-name gsm8k-b200-smoke-01 2>&1 | tee -a outputs/logs/gsm8k-b200-smoke-01.log
+```
+
+After `GSM8K completed`, check the smoke summary's `optimized_batches` and
+skipped batches. Prepare full inputs only if matching
+`data/prepared/gsm8k-followup/manifest.json` does not already exist:
+
+```bash
+python -m reward_gap.cli gsm8k-prepare --config configs/gsm8k_b200_full.json --download
+```
+
+Start the full experiment:
+
+```bash
+python -u -m reward_gap.cli gsm8k-preflight --config configs/gsm8k_b200_full.json &&
+python -u -m reward_gap.cli gsm8k-run --config configs/gsm8k_b200_full.json --run-name gsm8k-b200-full-01 2>&1 | tee -a outputs/logs/gsm8k-b200-full-01.log
+```
+
+Detach with **Ctrl+B**, then **D**. Reconnect with `tmux attach -t gsm8k-b200`.
+Keep the pod running; tmux does not survive a pod restart. After a genuine
+interruption, restore/activate the environment and repeat the full command
+with the same config and run name. Up to nine updates after the latest saved
+training checkpoint may repeat. Do not launch a second copy of an active run.
+Use a fresh run name for this preset; resume an older experiment with its
+original config. Results are in `outputs/gsm8k-b200-full-01/`.
+
 ## 8. Resume, pause and find your results
 
 `--run-name` selects the output directory. For example, `teachers-full-01`
