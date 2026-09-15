@@ -3,13 +3,13 @@
 import csv
 import json
 import random
-from collections import defaultdict
 
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from reward_gap.artifacts import atomic_write_json
+from reward_gap.gsm8k.costs import summarize_grading_costs
 from reward_gap.gsm8k.metrics import _correlation
 from reward_gap.gsm8k.recovery import aggregate_present
 
@@ -82,24 +82,7 @@ def write_report(folder, summary):
     summary.update(aggregate_final=aggregates, paired_knn30_minus_knn4=paired,
                    paired_difference_mean=float(np.mean([r["numeric_match_difference"] for r in paired])) if paired else None,
                    paired_difference_sample_std=float(np.std([r["numeric_match_difference"] for r in paired], ddof=1)) if len(paired) > 1 else None)
-    costs = defaultdict(lambda: {"generation_attempts": 0, "invalid_attempts": 0, "cache_hits": 0,
-                                "embedding_forwards": 0, "unknown_output_attempts": 0,
-                                "input_tokens": 0, "generated_tokens": 0, "seconds": 0.})
-    for path in folder.rglob("grading_cost.jsonl"):
-        for line in path.read_text(encoding="utf-8").splitlines():
-            event = json.loads(line)
-            key = f"{path.parent.relative_to(folder).as_posix()}/{event['phase']}/{event['role']}"
-            cost = costs[key]
-            cost["generation_attempts"] += "attempt" in event
-            cost["invalid_attempts"] += event.get("valid_grade") is False
-            cost["cache_hits"] += bool(event.get("cache_hit"))
-            cost["embedding_forwards"] += bool(event.get("embedding_only"))
-            cost["unknown_output_attempts"] += event.get("output_tokens_known") is False
-            for field in ("input_tokens", "generated_tokens", "seconds"):
-                cost[field] += event[field]
-    for cost in costs.values():
-        cost["valid_attempt_fraction"] = 1 - cost["invalid_attempts"] / cost["generation_attempts"] if cost["generation_attempts"] else None
-    summary["grading_cost"] = dict(costs)
+    summary["grading_cost"] = summarize_grading_costs(folder.rglob("grading_cost.jsonl"), root=folder)
     lines = ["# GSM8K: matched 4B versus 30B memory teachers", "",
              f"Protocol: `{summary['protocol']}`. Numeric checker: `{summary['parser']}`.",
              "Primary comparison: kNN–30B minus kNN–4B numeric-match rate, paired within each seed.",
@@ -121,6 +104,7 @@ def write_report(folder, summary):
               "Numeric correctness does not establish reasoning correctness. A smaller gap error against a different teacher is not evidence of better answers.",
               "Per-seed final means/sample standard deviations and paired differences are in summary.json. One-seed standard deviations are undefined.",
               "Cost logs count grading attempts, retries, cache hits, tokens and grading time. They exclude policy training and model loading time.",
+              "generation_attempts counts individual answers; generation_calls and embedding_forwards count model calls, including batches.",
               "Generation exceptions count as failed attempts; their unavailable output-token counts are flagged separately, not treated as known zero output.",
               "The official test set was previously inspected in exploratory work; this is a separate follow-up protocol."]
     if not summary["test_evaluated"]:

@@ -25,15 +25,20 @@ def test_partial_grading_keeps_next_question_and_bounds_each_retry(loaded, tmp_p
     grader.questions[other.id] = other
     calls = []
     def generate(**kwargs):
-        calls.append(1)
-        text = "no grade" if len(calls) <= 2 else "SCORE: 4"
-        suffix = torch.tensor([loaded.tokenizer.encode(text, add_special_tokens=False)])
-        return torch.cat((kwargs["input_ids"], suffix), dim=1)
+        ids = kwargs["input_ids"]
+        calls.append(len(ids))
+        texts = [loaded.tokenizer.decode(row, skip_special_tokens=False) for row in ids]
+        rows = [loaded.tokenizer.encode("SCORE: 4" if "Other question?" in text else "no grade", add_special_tokens=False)
+                + [loaded.tokenizer.eos_token_id] for text in texts]
+        suffix = torch.full((len(rows), max(map(len, rows))), loaded.tokenizer.pad_token_id, dtype=torch.long)
+        for i, row in enumerate(rows):
+            suffix[i, :len(row)] = torch.tensor(row)
+        return torch.cat((ids, suffix), dim=1)
     monkeypatch.setattr(loaded.model, "generate", generate)
     batches, errors = grader.score_partial([prompt, other.prompt()], ["5", "2"], return_embeddings=True)
     assert batches[0] is None and errors[0]
     assert batches[1].scores == (4.,) and errors[1] is None
-    assert len(calls) == 3
+    assert calls == [2, 1]
     assert len(list((tmp_path / "grade_cache").glob("*.json"))) == 1
 
 

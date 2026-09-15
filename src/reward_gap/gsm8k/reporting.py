@@ -1,12 +1,11 @@
 """Numeric, format, grader and PPO-KL results for every GSM8K seed."""
 
 import csv
-import json
-from collections import defaultdict
 
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+from reward_gap.gsm8k.costs import summarize_grading_costs
 from reward_gap.gsm8k.recovery import aggregate_present
 
 
@@ -35,21 +34,7 @@ def write_report(folder, summary):
     summary["paired_knn_minus_proxy"] = paired
     summary["paired_difference_mean"] = float(np.mean([r["numeric_match_difference"] for r in paired])) if paired else None
     summary["paired_difference_sample_std"] = float(np.std([r["numeric_match_difference"] for r in paired], ddof=1)) if len(paired) > 1 else None
-    costs = defaultdict(lambda: {"events": 0, "generation_attempts": 0, "embedding_forwards": 0,
-                                "cache_hits": 0, "input_tokens": 0, "generated_tokens": 0, "seconds": 0., "invalid_attempts": 0})
-    log = folder / "grading_cost.jsonl"
-    if log.is_file():
-        for line in log.read_text(encoding="utf-8").splitlines():
-            event = json.loads(line)
-            bucket = costs[f"{event['phase']}/{event['role']}"]
-            bucket["events"] += 1
-            bucket["generation_attempts"] += "attempt" in event
-            bucket["embedding_forwards"] += bool(event.get("embedding_only"))
-            bucket["cache_hits"] += bool(event.get("cache_hit"))
-            bucket["invalid_attempts"] += event.get("valid_grade") is False
-            for key in ("input_tokens", "generated_tokens", "seconds"):
-                bucket[key] += event[key]
-    summary["grading_cost"] = dict(costs)
+    summary["grading_cost"] = summarize_grading_costs([folder / "grading_cost.jsonl"])
     lines = ["# GSM8K Experiment 2", "", f"Protocol: `{summary['protocol']}`; numeric checker: `{summary['parser']}`.",
              "Numeric-match rate is the primary endpoint. All responses, including unresolved cases, remain in the denominator.",
              "Missing grades are excluded only from grader/gap statistics; graded_count and failed_count give coverage.",
@@ -65,7 +50,8 @@ def write_report(folder, summary):
                   "Per-seed results, final means/sample standard deviations, paired kNN-minus-proxy differences,",
                   "and grading costs are also saved in summary.json. Single-seed standard deviations are undefined.",
                   "Training KL is TRL's sampled rollout log-ratio estimate before that update, not a greedy-test KL.",
-                  "Grading cost includes retries and cache hits. It excludes policy generation/training time.", ""])
+                  "Grading cost includes retries and cache hits. It excludes policy generation/training time.",
+                  "generation_attempts counts individual answers; generation_calls and embedding_forwards count model calls, including batches.", ""])
     if not summary["test_evaluated"]:
         lines.append("Official-test evaluation is disabled or pending; these are development results.")
     elif summary["test_limit"] is not None:

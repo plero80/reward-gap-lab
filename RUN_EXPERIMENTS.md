@@ -247,8 +247,10 @@ NVIDIA lists 141 GB memory and BF16 support for H200 NVL
 The preset uses `cuda:0` and BF16. It keeps 16 responses per PPO batch,
 minibatches of 4, two PPO epochs, the same learning rate and answer token budget.
 Preparation/evaluation policy generation uses batches of 8 instead of 2.
-The current language graders still process answers individually; that setting
-does not batch grader generation or guarantee a particular speedup.
+Language graders now generate grades and extract embeddings in actual GPU
+batches, capped by `scoring.batch_size` (8 in this preset). Cache hits and
+completed retries are removed from the batch. Actual speedup still needs
+measurement on the pod.
 
 The full run has seeds 42/43/44, 400 scheduled batches per training arm, and
 official-test evaluation enabled without a test limit. It writes one rolling
@@ -607,6 +609,29 @@ Use a fresh run name for this preset; resume an older experiment with its
 original config. Results are in `outputs/gsm8k-b300-full-01/`.
 
 ## B200: standard Experiment 2 (GSM8K)
+
+The current code uses `scoring.batch_size=8` for actual grader inference,
+including PPO reward grading. No config change is needed to enable batching.
+Use the smoke check below to measure memory and throughput on the B200 before
+increasing that limit. Updates must reach the pod and the Python process must
+restart before the new implementation takes effect; an already running process
+continues using its loaded code. Resume a compatible run with its original
+config and run name, retaining its checkpoints and grade cache.
+
+Generation/embedding events in `grading_cost.jsonl` now include `batch_size`,
+`batch_id`, `batch_seconds` and `execution: batched_grading_v1`. A batch can be
+smaller than 8 after cache filtering, deduplication or successful retries.
+Cost summaries distinguish per-answer `generation_attempts` from actual
+`generation_calls` and `embedding_forwards`; shared GPU time is counted once.
+To test the new implementation after a completed smoke run, use a fresh smoke
+run name, for example `--run-name gsm8k-b200-batched-smoke-01`. Reusing a
+completed smoke run only reuses its saved results and does not benchmark the
+new code. Keep the original full run name when resuming training.
+Check GPU activity in a separate terminal while grading:
+
+```bash
+nvidia-smi --query-gpu=timestamp,utilization.gpu,memory.used,power.draw --format=csv -l 2
+```
 
 Use one B200 GPU with `configs/gsm8k_b200_full.json`. This preset uses
 BF16, scoring batches of 8, and recovery checkpoints every 10 updates.
